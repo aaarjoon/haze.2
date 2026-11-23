@@ -1,245 +1,1107 @@
 diff --git a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
-index 3e41048..963b7db 100644
+index 3e41048..c7f1cc1 100644
 --- a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
 +++ b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
-@@ -128,7 +128,7 @@ class PreferencesStore(context: Context) {
+@@ -127,8 +127,13 @@ class PreferencesStore(context: Context) {
+         prefs.edit().putString(KEY_PREFERRED_LYRICS, value).apply()
      }
  
-     /** How the lyrics are drawn: animated word by word, or as plain lines. */
+-    /** How the lyrics are drawn: animated word by word, or as plain lines. */
 -    enum class LyricsStyle { ANIMATED, CLASSIC }
-+    enum class LyricsStyle { ANIMATED, CLASSIC, CONSTELLATION, MESSAGES }
++    /**
++     * How the lyrics are drawn: animated word by word, as plain lines, or as a
++     * chat that fills with message bubbles as the song is sung, or as a
++     * constellation whose stars are lit by the words, which turns the phone
++     * onto its side.
++     */
++    enum class LyricsStyle { ANIMATED, CLASSIC, MESSAGES, CONSTELLATION }
  
      private val _lyricsStyle = MutableStateFlow(
          LyricsStyle.entries.firstOrNull { it.name == prefs.getString(KEY_LYRICS_STYLE, null) } ?: LyricsStyle.ANIMATED,
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
+index 7a0f1ac..2f9d770 100644
+--- a/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
++++ b/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
+@@ -151,7 +151,7 @@ fun ClassicLyricsView(
+ }
+ 
+ /** Where each timed word sits in the line's text, found in order; null for one not found. */
+-private fun wordRanges(line: LyricLine): List<IntRange?> {
++internal fun wordRanges(line: LyricLine): List<IntRange?> {
+     var cursor = 0
+     return line.words.map { word ->
+         val at = line.text.indexOf(word.text, cursor)
+@@ -165,7 +165,7 @@ private fun wordRanges(line: LyricLine): List<IntRange?> {
+ }
+ 
+ /** The line, coloured as far as it has been sung at [positionMs]. */
+-private fun sungSoFar(
++internal fun sungSoFar(
+     line: LyricLine,
+     ranges: List<IntRange?>,
+     positionMs: Long,
 diff --git a/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt
 new file mode 100644
-index 0000000..4038703
+index 0000000..c52ed9a
 --- /dev/null
 +++ b/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,381 @@
 +package dev.lelonio.square.ui.player
 +
-+import android.content.pm.ActivityInfo
 +import androidx.compose.foundation.Canvas
-+import androidx.compose.foundation.background
-+import androidx.compose.foundation.clickable
-+import androidx.compose.foundation.layout.Arrangement
-+import androidx.compose.foundation.layout.Box
-+import androidx.compose.foundation.layout.Column
 +import androidx.compose.foundation.layout.fillMaxSize
-+import androidx.compose.foundation.layout.fillMaxWidth
-+import androidx.compose.foundation.layout.padding
 +import androidx.compose.material3.MaterialTheme
-+import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.DisposableEffect
 +import androidx.compose.runtime.State
 +import androidx.compose.runtime.remember
-+import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Rect
 +import androidx.compose.ui.graphics.Brush
 +import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.Path
++import androidx.compose.ui.graphics.drawscope.DrawScope
++import androidx.compose.ui.graphics.drawscope.withTransform
++import androidx.compose.ui.graphics.lerp
 +import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.TextMeasurer
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.drawText
 +import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.rememberTextMeasurer
 +import androidx.compose.ui.unit.dp
 +import androidx.compose.ui.unit.sp
-+import android.app.Activity
++import dev.lelonio.square.data.LyricLine
 +import dev.lelonio.square.data.Lyrics
++import kotlin.math.sin
++import kotlin.math.sqrt
++
++/** The glow and heart of the word being sung. */
++private val StarOrange = Color(0xFFFF5A1F)
++
++/** The warm white of the word being sung. */
++private val StarPeach = Color(0xFFFFD9C4)
++
++/** How long the lines to a new star take to reach it. */
++private const val LINK_MS = 260f
++
++/** How long the old phrase takes to go out as the next one starts. */
++private const val HAND_OVER_MS = 450f
++
++/** How long a phrase stays up after its last word before it fades out on its own. */
++private const val LINGER_MS = 1600L
++
++/** How long that fade takes. */
++private const val LINGER_FADE_MS = 500f
++
++/** How long a word takes to shrink to a label once the next word is sung. */
++private const val SHRINK_MS = 350f
++
++/** A label's size once shrunk, against the size of the word being sung. */
++private const val LABEL_SCALE = 0.37f
++
++/** A four-pointed sparkle of radius 1, centred on the origin. */
++private val SparkPath = Path().apply {
++    moveTo(0f, -1f)
++    lineTo(0.2f, -0.2f)
++    lineTo(1f, 0f)
++    lineTo(0.2f, 0.2f)
++    lineTo(0f, 1f)
++    lineTo(-0.2f, 0.2f)
++    lineTo(-1f, 0f)
++    lineTo(-0.2f, -0.2f)
++    close()
++}
 +
 +/**
-+ * Wide, centered lyric presentation. This mode deliberately uses landscape
-+ * while visible and restores portrait when the user leaves it.
++ * The lyrics as a constellation.
++ *
++ * A line is a phrase, and a phrase is a small piece of sky: each word, as it is
++ * sung, lights a star somewhere on the screen and is joined to the one before
++ * by a thin line that draws itself across. The word being sung is large and
++ * warm, with an orange star and a glow; the moment the next word comes it
++ * shrinks to a small label beside its star and stays there, and the phrase
++ * builds up until the next line starts, when it fades and a new sky begins.
++ *
++ * Where the stars sit is chosen once for each line from the line itself, so a
++ * song is laid out the same way every time it is played.
++ *
++ * It is made to be read wide, so showing it turns the phone onto its side,
++ * and leaving it hands the choice back to the phone. Lyrics that are not
++ * synced have no "now" for a sky to follow, so they are shown plainly, as in
++ * the classic view, and the phone is left as it is.
 + */
 +@Composable
 +fun ConstellationLyricsView(
 +    lyrics: Lyrics,
 +    positionMs: State<Long>,
-+    showTranslation: Boolean,
-+    onSeek: (Long) -> Unit,
++    isPlaying: Boolean,
 +    modifier: Modifier = Modifier,
++    showTranslation: Boolean = false,
++    onSeek: (Long) -> Unit,
 +) {
++    if (!lyrics.synced) {
++        ClassicLyricsView(
++            lyrics = lyrics,
++            positionMs = positionMs,
++            modifier = modifier,
++            showTranslation = showTranslation,
++            onSeek = onSeek,
++        )
++    } else {
++        ConstellationSky(lyrics, positionMs, isPlaying, modifier)
++    }
++}
++
++@Composable
++private fun ConstellationSky(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    isPlaying: Boolean,
++    modifier: Modifier,
++) {
++    // Use landscape for the constellation, then explicitly return to portrait
++    // when the user leaves it so other lyric styles are immediately usable.
 +    val context = LocalContext.current
-+    DisposableEffect(context) {
-+        val activity = context.findActivity()
-+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-+        onDispose {
-+            // The player returns to its normal portrait presentation so the
-+            // user can choose another lyrics mode without rotating manually.
-+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-+        }
++    DisposableEffect(Unit) {
++        lockVideoOrientation(context, true)
++        onDispose { lockVideoOrientation(context, false) }
 +    }
 +
-+    val active = remember(lyrics, positionMs.value) {
-+        lyrics.lines.indexOfLast { (it.startTimeMs ?: 0L) <= positionMs.value }
-+    }.coerceIn(0, (lyrics.lines.size - 1).coerceAtLeast(0))
++    val ink = GlassInk
++    val measurer = rememberTextMeasurer()
++    val clock = rememberFrameClock(positionMs, isPlaying)
++    val bigStyle = MaterialTheme.typography.headlineSmall.copy(
++        fontSize = 30.sp,
++        fontWeight = FontWeight.Bold,
++    )
++    val lines = lyrics.lines
++    val starts = remember(lyrics) { LongArray(lines.size) { lines[it].startTimeMs ?: 0L } }
++    // Built the first time a line is needed, then kept.
++    val phrases = remember(lyrics) { arrayOfNulls<Phrase>(lines.size) }
 +
-+    Box(
-+        modifier = modifier
-+            .fillMaxSize()
-+            .background(Brush.radialGradient(listOf(Color(0xFF25365C), Color(0xFF080D1B)))),
-+        contentAlignment = Alignment.Center,
-+    ) {
-+        Canvas(Modifier.fillMaxSize()) {
-+            val stars = listOf(
-+                0.08f to 0.18f, 0.19f to 0.72f, 0.31f to 0.27f, 0.43f to 0.82f,
-+                0.57f to 0.14f, 0.68f to 0.66f, 0.81f to 0.31f, 0.92f to 0.78f,
-+                0.75f to 0.88f, 0.12f to 0.91f, 0.49f to 0.48f,
-+            )
-+            stars.forEachIndexed { index, (x, y) ->
-+                drawCircle(
-+                    color = Color.White.copy(alpha = if (index % 3 == 0) 0.85f else 0.35f),
-+                    radius = if (index % 3 == 0) 2.2.dp.toPx() else 1.2.dp.toPx(),
-+                    center = androidx.compose.ui.geometry.Offset(size.width * x, size.height * y),
-+                )
++    Canvas(modifier.fillMaxSize()) {
++        val pos = clock.value
++
++        // The phrase being sung: the latest line that has started and has
++        // words. A gap in the song leaves the last phrase up until it fades.
++        var current = -1
++        for (i in lines.indices.reversed()) {
++            if (starts[i] <= pos && lines[i].text.isNotBlank()) {
++                current = i
++                break
 +            }
 +        }
-+        if (lyrics.lines.isNotEmpty()) {
-+            Column(
-+                modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp),
-+                horizontalAlignment = Alignment.CenterHorizontally,
-+                verticalArrangement = Arrangement.spacedBy(12.dp),
-+            ) {
-+                listOf(active - 1, active, active + 1).forEach { index ->
-+                    val line = lyrics.lines.getOrNull(index) ?: return@forEach
-+                    val focused = index == active
-+                    Text(
-+                        text = line.text.ifBlank { "♪" },
-+                        color = Color.White.copy(alpha = if (focused) 1f else 0.38f),
-+                        fontSize = if (focused) 30.sp else 19.sp,
-+                        lineHeight = if (focused) 38.sp else 26.sp,
-+                        fontWeight = if (focused) FontWeight.Bold else FontWeight.Medium,
-+                        textAlign = TextAlign.Center,
-+                        modifier = Modifier
-+                            .fillMaxWidth()
-+                            .clickable { line.startTimeMs?.let(onSeek) }
-+                            .padding(vertical = 4.dp),
-+                    )
-+                    if (focused && showTranslation && !line.translation.isNullOrBlank()) {
-+                        Text(
-+                            line.translation.orEmpty(),
-+                            color = Color.White.copy(alpha = 0.68f),
-+                            style = MaterialTheme.typography.bodyLarge,
-+                            textAlign = TextAlign.Center,
-+                        )
-+                    }
++        if (current < 0) return@Canvas
++        var before = -1
++        for (i in current - 1 downTo 0) {
++            if (lines[i].text.isNotBlank()) {
++                before = i
++                break
++            }
++        }
++
++        // The round buttons down the right of the screen keep to their own
++        // strip, so the sky leaves it free.
++        val area = Rect(
++            left = 28.dp.toPx(),
++            top = 20.dp.toPx(),
++            right = size.width - 64.dp.toPx(),
++            bottom = size.height - 20.dp.toPx(),
++        )
++
++        val sinceStart = pos - starts[current]
++        val handOver = (sinceStart / HAND_OVER_MS).coerceIn(0f, 1f)
++
++        if (before >= 0 && handOver < 1f) {
++            drawPhrase(
++                phraseFor(phrases, lines, before), pos, 1f - handOver,
++                area, ink, measurer, bigStyle,
++            )
++        }
++        drawPhrase(
++            phraseFor(phrases, lines, current), pos, 1f,
++            area, ink, measurer, bigStyle,
++        )
++    }
++}
++
++/** One line of the song as a piece of sky: when its words come, and where its stars are. */
++private class Phrase(
++    val line: LyricLine,
++    val reveal: Reveal,
++    /** Where each star sits, as a fraction of the sky, across and down. */
++    val xs: FloatArray,
++    val ys: FloatArray,
++    /** For a star, an earlier one it is also joined to, or -1. */
++    val extra: IntArray,
++) {
++    /** Each word, measured at the size of the word being sung, when it is first needed. */
++    val labels = arrayOfNulls<TextLayoutResult>(xs.size)
++}
++
++private fun phraseFor(cache: Array<Phrase?>, lines: List<LyricLine>, index: Int): Phrase {
++    cache[index]?.let { return it }
++    val line = lines[index]
++    val reveal = revealOf(line, lines.getOrNull(index + 1)?.startTimeMs)
++    val count = reveal.starts.size
++    val random = java.util.Random(index * 7919L + line.text.hashCode())
++
++    val xs = FloatArray(count)
++    val ys = FloatArray(count)
++    var x = 0.12f + random.nextFloat() * 0.25f
++    var y = 0.25f + random.nextFloat() * 0.5f
++    var direction = 1f
++    for (i in 0 until count) {
++        var nx = x
++        var ny = y
++        var tries = 0
++        do {
++            if (i > 0) {
++                nx = x + direction * (0.10f + random.nextFloat() * 0.14f)
++                ny = y + (random.nextFloat() - 0.5f) * 0.6f
++                // Turns back at the edge, so a long line zigzags across the sky.
++                if (nx > 0.92f || nx < 0.08f) {
++                    direction = -direction
++                    nx = x + direction * (0.10f + random.nextFloat() * 0.14f)
 +                }
 +            }
++            nx = nx.coerceIn(0.08f, 0.92f)
++            ny = ny.coerceIn(0.14f, 0.86f)
++            tries++
++        } while (tries < 12 && (0 until i).any { j ->
++                // The sky is wider than it is tall, so a step across counts for less.
++                val dx = (xs[j] - nx) * 1.8f
++                val dy = ys[j] - ny
++                sqrt(dx * dx + dy * dy) < 0.16f
++            })
++        xs[i] = nx
++        ys[i] = ny
++        x = nx
++        y = ny
++    }
++    // Now and then a star is joined back to an earlier one too, so the lines
++    // make a web and not just a path.
++    val extra = IntArray(count) { i ->
++        if (i >= 3 && random.nextInt(100) < 35) random.nextInt(i - 1) else -1
++    }
++    return Phrase(line, reveal, xs, ys, extra).also { cache[index] = it }
++}
++
++private fun mix(from: Float, to: Float, fraction: Float): Float = from + (to - from) * fraction
++
++/** Overshoots a little on the way to 1, like a spring. */
++private fun backOut(fraction: Float): Float {
++    val c = fraction.coerceIn(0f, 1f) - 1f
++    return 1f + 2.70158f * c * c * c + 1.70158f * c * c
++}
++
++private fun smooth(fraction: Float): Float {
++    val x = fraction.coerceIn(0f, 1f)
++    return x * x * (3f - 2f * x)
++}
++
++private fun clampTo(value: Float, low: Float, high: Float): Float =
++    if (low > high) (low + high) / 2f else value.coerceIn(low, high)
++
++private fun DrawScope.drawPhrase(
++    phrase: Phrase,
++    pos: Long,
++    fade: Float,
++    area: Rect,
++    ink: Color,
++    measurer: TextMeasurer,
++    bigStyle: TextStyle,
++) {
++    val reveal = phrase.reveal
++    val count = reveal.starts.size
++    if (count == 0) return
++
++    // The word being sung: the last one that has started.
++    var current = -1
++    for (i in 0 until count) if (reveal.starts[i] <= pos) current = i
++    if (current < 0) return
++
++    // A phrase left standing after its last word goes out on its own.
++    val lingerEnd = reveal.ends[count - 1] + LINGER_MS
++    val alpha = fade * (1f - (pos - lingerEnd) / LINGER_FADE_MS).coerceIn(0f, 1f)
++    if (alpha <= 0f) return
++
++    val dp = 1.dp.toPx()
++    val width = area.width
++    val height = area.height
++    fun starX(i: Int) = area.left + phrase.xs[i] * width
++    fun starY(i: Int) = area.top + phrase.ys[i] * height
++
++    // The lines first, so the stars and words sit over them.
++    val lineColor = ink.copy(alpha = 0.32f * alpha)
++    for (i in 1..current) {
++        val reach = ((pos - reveal.starts[i]) / LINK_MS).coerceIn(0f, 1f)
++        val from = Offset(starX(i - 1), starY(i - 1))
++        val to = Offset(starX(i), starY(i))
++        drawLine(
++            lineColor, from,
++            Offset(mix(from.x, to.x, reach), mix(from.y, to.y, reach)),
++            strokeWidth = dp,
++        )
++        val back = phrase.extra[i]
++        if (back >= 0) {
++            val other = Offset(starX(back), starY(back))
++            drawLine(
++                lineColor.copy(alpha = 0.18f * alpha), to,
++                Offset(mix(to.x, other.x, reach), mix(to.y, other.y, reach)),
++                strokeWidth = dp,
++            )
++        }
++    }
++
++    for (i in 0..current) {
++        val sung = pos - reveal.starts[i]
++        val centre = Offset(starX(i), starY(i))
++        val isCurrent = i == current
++
++        // The star: it pops in, and the one being sung breathes.
++        val appear = backOut(sung / 220f)
++        val breathe = if (isCurrent) 1f + 0.1f * sin(pos / 170f) else 1f
++        val radius = (if (isCurrent) 7.dp.toPx() else 4.dp.toPx()) * appear * breathe
++        if (isCurrent) {
++            val glow = 20.dp.toPx() * appear
++            drawCircle(
++                brush = Brush.radialGradient(
++                    listOf(StarOrange.copy(alpha = 0.55f * alpha), Color.Transparent),
++                    center = centre,
++                    radius = glow,
++                ),
++                radius = glow,
++                center = centre,
++            )
++        }
++        val starColor = if (isCurrent) StarOrange else ink.copy(alpha = 0.8f)
++        withTransform({
++            translate(centre.x, centre.y)
++            scale(radius, radius, Offset.Zero)
++        }) {
++            drawPath(SparkPath, starColor.copy(alpha = starColor.alpha * alpha))
++        }
++
++        // The word: large and warm while it is sung, a small label after.
++        val range = phrase.reveal.ranges[i]
++        val line = phrase.line
++        if (range.last >= line.text.length) continue
++        val layout = phrase.labels[i] ?: measurer.measure(
++            line.text.substring(range.first, range.last + 1),
++            bigStyle,
++        ).also { phrase.labels[i] = it }
++        val w = layout.size.width.toFloat()
++        val h = layout.size.height.toFloat()
++
++        // How far it has shrunk: not at all while it is the word being sung.
++        val shrunk = if (isCurrent) 0f else smooth((pos - reveal.starts[i + 1]) / SHRINK_MS)
++        val scale = if (isCurrent) 0.55f + 0.45f * backOut(sung / 200f) else mix(1f, LABEL_SCALE, shrunk)
++
++        // Beside its star, on whichever side has the room; as a label, below
++        // and to the right of it.
++        val bigSide = if (phrase.xs[i] > 0.6f) -1f else 1f
++        val bigCx = centre.x + bigSide * (w / 2f + 16.dp.toPx())
++        val bigCy = centre.y
++        val smallCx = centre.x + w * LABEL_SCALE / 2f + 7.dp.toPx()
++        val smallCy = centre.y + 9.dp.toPx()
++        var cx = mix(bigCx, smallCx, shrunk)
++        var cy = mix(bigCy, smallCy, shrunk)
++        cx = clampTo(cx, area.left + w * scale / 2f, area.right - w * scale / 2f)
++        cy = clampTo(cy, area.top + h * scale / 2f, area.bottom - h * scale / 2f)
++
++        val big = lerp(ink, StarPeach, 0.55f)
++        val small = ink.copy(alpha = 0.55f)
++        val wordColor = lerp(big, small, shrunk)
++        val appearAlpha = (sung / 140f).coerceIn(0f, 1f)
++        val labelCentre = Offset(cx, cy)
++        withTransform({ scale(scale, scale, labelCentre) }) {
++            drawText(
++                layout,
++                color = wordColor.copy(alpha = wordColor.alpha * alpha * appearAlpha),
++                topLeft = Offset(cx - w / 2f, cy - h / 2f),
++            )
 +        }
 +    }
 +}
-+
-+private tailrec fun android.content.Context.findActivity(): Activity? = when (this) {
-+    is Activity -> this
-+    is android.content.ContextWrapper -> baseContext.findActivity()
-+    else -> null
-+}
 diff --git a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
-index cd955be..6f0996a 100644
+index cd955be..beb3d8e 100644
 --- a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
 +++ b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
+@@ -232,8 +232,8 @@ fun LyricsOptionsPanel(
+                     }
+                 }
+                 Heading(stringResource(R.string.lyrics_style_title), top = 10.dp)
+-                // Two side by side, on one line: a choice of two does not need
+-                // two rows, and the panel has to fit the lyrics' own space.
++                // Side by side, on one line: a choice of three short names does not need
++                // three rows, and the panel has to fit the lyrics' own space.
+                 Row(
+                     Modifier.padding(horizontal = 18.dp),
+                     horizontalArrangement = Arrangement.spacedBy(8.dp),
 @@ -245,6 +245,8 @@ fun LyricsOptionsPanel(
                                  when (option) {
                                      LyricsStyle.ANIMATED -> R.string.lyrics_style_animated
                                      LyricsStyle.CLASSIC -> R.string.lyrics_style_classic
-+                                    LyricsStyle.CONSTELLATION -> R.string.lyrics_style_constellation
 +                                    LyricsStyle.MESSAGES -> R.string.lyrics_style_messages
++                                    LyricsStyle.CONSTELLATION -> R.string.lyrics_style_constellation
                                  },
                              ),
                              style = MaterialTheme.typography.bodyMedium,
-diff --git a/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/LyricsTiming.kt b/app/src/main/java/dev/lelonio/square/ui/player/LyricsTiming.kt
 new file mode 100644
-index 0000000..92262e1
+index 0000000..9312d44
 --- /dev/null
-+++ b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
-@@ -0,0 +1,94 @@
++++ b/app/src/main/java/dev/lelonio/square/ui/player/LyricsTiming.kt
+@@ -0,0 +1,92 @@
 +package dev.lelonio.square.ui.player
 +
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.runtime.withFrameNanos
++import dev.lelonio.square.data.LyricLine
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.launch
++import kotlin.math.abs
++
++/** When each word of a line is sung and stops being sung, and where it sits in the line's text. */
++internal class Reveal(val starts: LongArray, val ends: LongArray, val ranges: List<IntRange>)
++
++/**
++ * The words of [line] with the moment each is sung: the source's own timing
++ * where it has it, otherwise the line's time shared out by word length, over
++ * the first four fifths of the time before the next line.
++ */
++internal fun revealOf(line: LyricLine, endMs: Long?): Reveal {
++    val found = wordRanges(line)
++    if (line.words.isNotEmpty() && found.none { it == null }) {
++        return Reveal(
++            LongArray(line.words.size) { line.words[it].startMs },
++            LongArray(line.words.size) { line.words[it].endMs },
++            found.map { it!! },
++        )
++    }
++    val spans = Regex("\\S+").findAll(line.text).map { it.range }.toList()
++    val start = line.startTimeMs ?: 0L
++    val room = ((endMs ?: (start + 4000L)) - start).coerceIn(600L, 6000L)
++    val singing = room * 4 / 5
++    val total = spans.sumOf { it.last - it.first + 2 }.coerceAtLeast(1)
++    var used = 0
++    val starts = LongArray(spans.size) { i ->
++        val at = start + singing * used / total
++        used += spans[i].last - spans[i].first + 2
++        at
++    }
++    // A word lasts until the next one starts; the last one to the end of the song's share.
++    val ends = LongArray(spans.size) { i ->
++        if (i < spans.lastIndex) starts[i + 1] else start + singing
++    }
++    return Reveal(starts, ends, spans)
++}
++
++/**
++ * Interpolates between the player's position reports on display frames.
++ *
++ * When playback is paused this observes the player's state without starting a
++ * frame loop. During playback it keeps animating between reports, resynchronises
++ * after a seek or a large clock correction, and stops immediately on pause.
++ */
++@Composable
++internal fun rememberFrameClock(positionMs: State<Long>, running: Boolean): State<Long> {
++    val smooth = remember(positionMs) { mutableStateOf(positionMs.value) }
++    LaunchedEffect(positionMs, running) {
++        if (!running) {
++            snapshotFlow { positionMs.value }.collect { smooth.value = it }
++            return@LaunchedEffect
++        }
++
++        var anchor = positionMs.value
++        var anchorAt = System.nanoTime()
++        smooth.value = anchor
++
++        val reporter = launch {
++            snapshotFlow { positionMs.value }.collect { reported ->
++                val now = System.nanoTime()
++                val expected = anchor + (now - anchorAt) / 1_000_000L
++                if (abs(reported - expected) > 600L) smooth.value = reported
++                anchor = reported
++                anchorAt = now
++            }
++        }
++
++        try {
++            while (isActive) {
++                withFrameNanos { }
++                val elapsed = ((System.nanoTime() - anchorAt) / 1_000_000L).coerceAtLeast(0L)
++                smooth.value = anchor + elapsed
++            }
++        } finally {
++            reporter.cancel()
++        }
++    }
++    return smooth
++}
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+new file mode 100644
+index 0000000..1aff892
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+@@ -0,0 +1,631 @@
++package dev.lelonio.square.ui.player
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.RepeatMode
++import androidx.compose.animation.core.Spring
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.spring
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Canvas
 +import androidx.compose.foundation.background
++import androidx.compose.foundation.border
 +import androidx.compose.foundation.clickable
 +import androidx.compose.foundation.layout.Arrangement
 +import androidx.compose.foundation.layout.Box
 +import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
 +import androidx.compose.foundation.layout.Row
 +import androidx.compose.foundation.layout.fillMaxSize
 +import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
 +import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.layout.widthIn
 +import androidx.compose.foundation.lazy.LazyColumn
-+import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.CircleShape
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.MaterialTheme
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.State
++import androidx.compose.runtime.derivedStateOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
++import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.BlendMode
++import androidx.compose.ui.graphics.Brush
 +import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.CompositingStrategy
++import androidx.compose.ui.graphics.TransformOrigin
++import androidx.compose.ui.graphics.drawscope.DrawScope
++import androidx.compose.ui.graphics.drawscope.withTransform
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.text.AnnotatedString
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.TextMeasurer
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.drawText
++import androidx.compose.ui.text.rememberTextMeasurer
 +import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.LayoutDirection
 +import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import dev.lelonio.square.data.LyricLine
 +import dev.lelonio.square.data.Lyrics
 +
-+/** A conversational, message-bubble presentation of the lyric lines. */
++/** The blue of a sent message. */
++private val SentBlue = Color(0xFF0A84FF)
++
++/** How long a word takes to come in once it is sung. */
++private const val WORD_FADE_MS = 140L
++
++/** How long a word takes to shrink back to size once it has been sung. */
++private const val SETTLE_MS = 220L
++
++/** How much bigger than the rest of the line a word is while it is sung. */
++private const val POP = 0.30f
++
++/**
++ * The lyrics as a conversation.
++ *
++ * Nothing is shown ahead of the song. Each line arrives as a message bubble
++ * when it is reached, and its words come in one at a time, each the moment
++ * it is sung. Where the source times its words that is exact; where it only
++ * times the line, the words are spread across the line by their length.
++ *
++ * The two sides take turns, but not always one line each: a side often keeps
++ * the floor for two or three lines before the other answers, and a gap in the
++ * song hands the turn over. Which is which is chosen once per song, so it is
++ * the same every time the song is opened.
++ *
++ * A line that names a well-known place gets a map card (see [placeIn]); an
++ * instrumental gap shows the three dots of someone typing.
++ *
++ * Lyrics that are not synced have no "now" to follow, so they are laid out
++ * whole, from the top. A bubble pressed seeks to its line, and the history can
++ * be scrolled back through while the song plays.
++ */
 +@Composable
 +fun MessagesLyricsView(
 +    lyrics: Lyrics,
 +    positionMs: State<Long>,
-+    showTranslation: Boolean,
-+    onSeek: (Long) -> Unit,
++    isPlaying: Boolean,
 +    modifier: Modifier = Modifier,
++    showTranslation: Boolean = false,
++    onSeek: (Long) -> Unit,
 +) {
-+    val activeLine = remember(lyrics, positionMs.value) {
-+        // Binary search keeps playback updates inexpensive on long lyric sheets.
-+        var low = 0
-+        var high = lyrics.lines.size
-+        while (low < high) {
-+            val mid = (low + high) ushr 1
-+            if ((lyrics.lines[mid].startTimeMs ?: 0L) <= positionMs.value) low = mid + 1
-+            else high = mid
++    val synced = lyrics.synced
++
++    // Timed lyric sources are ordered by start time. Cache those times and use
++    // an upper-bound search, rather than scanning every line for each position
++    // report from the player.
++    val lineStarts = remember(lyrics) {
++        LongArray(lyrics.lines.size) { lyrics.lines[it].startTimeMs ?: 0L }
++    }
++    val activeLine by remember(lyrics, lineStarts) {
++        derivedStateOf {
++            if (!synced) -1 else lastStartedLine(lineStarts, positionMs.value)
 +        }
-+        low - 1
++    }
++
++    val chat = remember(lyrics) { chatLayout(lyrics.lines) }
++    val measurer = rememberTextMeasurer()
++
++    // A place gets its card the first time the song sings about it, not on
++    // every mention.
++    val places = remember(lyrics) {
++        val seen = HashSet<String>()
++        Array(lyrics.lines.size) { index ->
++            placeIn(lyrics.lines[index].text)?.takeIf { seen.add(it) }
++        }
++    }
++
++    val last = if (synced) activeLine else lyrics.lines.lastIndex
++
++    // The lines on screen. Synced: those reached so far, newest first, as the
++    // list is laid out from the bottom up like a chat. A blank line shows
++    // only while it is the current one, as the typing dots.
++    val indices = remember(lyrics, last) {
++        val reached = (0..last).filter { index ->
++            lyrics.lines[index].text.isNotBlank() || (synced && index == last)
++        }
++        if (synced) reached.asReversed() else reached
++    }
++
++    val listState = remember(lyrics) { LazyListState() }
++
++    // Back to the newest message when a new one arrives, unless the listener
++    // is reading further up.
++    LaunchedEffect(last) {
++        if (synced && !listState.isScrollInProgress) listState.animateScrollToItem(0)
 +    }
 +
 +    LazyColumn(
-+        modifier = modifier.fillMaxSize().padding(horizontal = 18.dp),
-+        verticalArrangement = Arrangement.spacedBy(12.dp),
-+        horizontalAlignment = Alignment.Start,
++        state = listState,
++        reverseLayout = synced,
++        // The round buttons down the right of the screen sit over the end of
++        // the list, so the end keeps clear of them.
++        contentPadding = PaddingValues(start = 16.dp, end = 64.dp, top = 48.dp, bottom = 48.dp),
++        modifier = modifier
++            .fillMaxSize()
++            .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
++            .drawWithContent {
++                drawContent()
++                drawRect(
++                    brush = Brush.verticalGradient(
++                        0f to Color.Transparent,
++                        0.12f to Color.Black,
++                        0.88f to Color.Black,
++                        1f to Color.Transparent,
++                    ),
++                    blendMode = BlendMode.DstIn,
++                )
++            },
 +    ) {
-+        itemsIndexed(lyrics.lines) { index, line ->
-+            val active = index == activeLine
-+            Row(
-+                modifier = Modifier.fillMaxWidth(),
-+                horizontalArrangement = if (index % 2 == 0) Arrangement.Start else Arrangement.End,
-+            ) {
-+                Column(
-+                    modifier = Modifier
-+                        .fillMaxWidth(0.88f)
-+                        .clip(
-+                            RoundedCornerShape(
-+                                topStart = 20.dp, topEnd = 20.dp,
-+                                bottomEnd = if (index % 2 == 0) 20.dp else 5.dp,
-+                                bottomStart = if (index % 2 == 0) 5.dp else 20.dp,
-+                            ),
-+                        )
-+                        .background(
-+                            if (active) Color(0xFF315B75) else Color(0xFF202A35),
-+                        )
-+                        .clickable { line.startTimeMs?.let(onSeek) }
-+                        .padding(horizontal = 16.dp, vertical = 12.dp),
-+                ) {
-+                    Text(
-+                        line.text.ifBlank { "♪" },
-+                        color = Color.White.copy(alpha = if (active) 1f else 0.72f),
-+                        style = MaterialTheme.typography.titleMedium,
-+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
++        items(indices, key = { it }) { index ->
++            val line = lyrics.lines[index]
++            // Sits close to the next bubble when the same side sends that one
++            // too, as a run of messages does.
++            val following = chat.next[index]
++            val grouped = following != -1 &&
++                chat.atEnd[following] == chat.atEnd[index] &&
++                (!synced || following <= last)
++            MessageBubble(
++                line = line,
++                endMs = lyrics.lines.getOrNull(index + 1)?.startTimeMs,
++                atEnd = chat.atEnd[index],
++                grouped = grouped,
++                place = places[index],
++                newest = synced && index == activeLine,
++                age = if (synced) activeLine - index else 0,
++                synced = synced,
++                isPlaying = isPlaying,
++                positionMs = positionMs,
++                measurer = measurer,
++                showTranslation = showTranslation,
++                onClick = { line.startTimeMs?.let(onSeek) },
++            )
++        }
++    }
++}
++
++/**
++ * Returns the last line whose start time is at or before [positionMs].
++ * [starts] is cached from the ordered lyric lines.
++ */
++private fun lastStartedLine(starts: LongArray, positionMs: Long): Int {
++    var low = 0
++    var high = starts.size
++    while (low < high) {
++        val middle = (low + high) ushr 1
++        if (starts[middle] <= positionMs) low = middle + 1 else high = middle
++    }
++    return low - 1
++}
++
++/** Which side each line is sent from, and which line is sent after it. */
++private class ChatLayout(val atEnd: BooleanArray, val next: IntArray)
++
++/**
++ * Hands out the turns. A side keeps the floor for one line about half the
++ * time, two lines about a third of the time, and three the rest; a gap in the
++ * song always passes it on. The dice are seeded from the song's own lines, so
++ * a song is always cut up the same way.
++ */
++private fun chatLayout(lines: List<LyricLine>): ChatLayout {
++    val random = java.util.Random(lines.size * 31L + (lines.firstOrNull()?.text?.hashCode() ?: 0))
++    val atEnd = BooleanArray(lines.size)
++    val next = IntArray(lines.size) { -1 }
++    var end = true
++    var left = 0
++    var gap = false
++    var previous = -1
++    for (index in lines.indices) {
++        if (lines[index].text.isBlank()) {
++            atEnd[index] = end
++            gap = true
++            continue
++        }
++        if (left <= 0 || gap) {
++            end = !end
++            val roll = random.nextInt(100)
++            left = if (roll < 50) 1 else if (roll < 82) 2 else 3
++        }
++        left--
++        gap = false
++        atEnd[index] = end
++        if (previous >= 0) next[previous] = index
++        previous = index
++    }
++    // A gap in the song shows the typing dots, and the dots belong on the side
++    // the next line is about to come from, not the side of the last one.
++    var upcoming = end
++    for (index in lines.indices.reversed()) {
++        if (lines[index].text.isBlank()) atEnd[index] = upcoming else upcoming = atEnd[index]
++    }
++    return ChatLayout(atEnd, next)
++}
++
++
++/** How long word [i] stays enlarged: as long as it is sung, within reason. */
++private fun holdMs(reveal: Reveal, i: Int): Long =
++    (reveal.ends[i] - reveal.starts[i]).coerceIn(250L, 900L)
++
++/** Whether word [i] is in its pop: coming in, held big, or settling back. */
++private fun popping(reveal: Reveal, i: Int, positionMs: Long): Boolean =
++    positionMs >= reveal.starts[i] &&
++        positionMs < reveal.starts[i] + holdMs(reveal, i) + SETTLE_MS
++
++/**
++ * How big word [i] is: it jumps up as it is sung, overshooting a little and
++ * settling, stays big while it is sung, then eases back to the size of the rest.
++ */
++private fun popScale(reveal: Reveal, i: Int, positionMs: Long): Float {
++    val t = positionMs - reveal.starts[i]
++    val hold = holdMs(reveal, i)
++    val rise = 120f
++    return when {
++        t < 0 -> 1f
++        t < rise -> {
++            val x = t / rise - 1f
++            1f + POP * (1f + 2.70158f * x * x * x + 1.70158f * x * x)
++        }
++        t < hold -> 1f + POP
++        else -> {
++            val x = ((t - hold).toFloat() / SETTLE_MS).coerceIn(0f, 1f)
++            1f + POP * (1f - x * x * (3f - 2f * x))
++        }
++    }
++}
++
++/**
++ * What is needed to draw the words of one line: the box each word occupies in
++ * the line, found once, and each word measured on its own the first time it
++ * is drawn, regular or bold, and kept. Measuring as the words come, rather
++ * than all of them when the line starts, keeps the start of a line from
++ * stalling a frame. Nothing here changes while the song moves on, so a frame
++ * costs a few draw calls and no text layout.
++ */
++private class LineDrawing {
++    var layout: TextLayoutResult? = null
++    var boxes: List<Rect> = emptyList()
++    private var words: List<AnnotatedString> = emptyList()
++    private var regular: Array<TextLayoutResult?> = emptyArray()
++    private var heavy: Array<TextLayoutResult?> = emptyArray()
++    private var style: TextStyle = TextStyle.Default
++    private var boldStyle: TextStyle = TextStyle.Default
++
++    fun build(layout: TextLayoutResult, line: LyricLine, reveal: Reveal, style: TextStyle) {
++        val wordTexts = ArrayList<AnnotatedString>(reveal.ranges.size)
++        val wordBoxes = ArrayList<Rect>(reveal.ranges.size)
++        for (range in reveal.ranges) {
++            val fits = range.first >= 0 &&
++                range.last < line.text.length &&
++                range.last < layout.layoutInput.text.length
++            wordTexts.add(
++                if (fits) {
++                    AnnotatedString(line.text.substring(range.first, range.last + 1))
++                } else {
++                    AnnotatedString("")
++                },
++            )
++            val first = if (fits) layout.getBoundingBox(range.first) else Rect.Zero
++            val end = if (fits) layout.getBoundingBox(range.last) else Rect.Zero
++            wordBoxes.add(Rect(first.left, first.top, end.right, first.bottom))
++        }
++        words = wordTexts
++        boxes = wordBoxes
++        regular = arrayOfNulls(wordTexts.size)
++        heavy = arrayOfNulls(wordTexts.size)
++        this.style = style
++        this.boldStyle = style.copy(fontWeight = FontWeight.Bold)
++        this.layout = layout
++    }
++
++    fun regularAt(i: Int, measurer: TextMeasurer): TextLayoutResult =
++        regular[i] ?: measurer.measure(words[i], style).also { regular[i] = it }
++
++    fun boldAt(i: Int, measurer: TextMeasurer): TextLayoutResult =
++        heavy[i] ?: measurer.measure(words[i], boldStyle).also { heavy[i] = it }
++}
++
++/**
++ * Draws the line word by word as it is sung: a word not yet sung is not
++ * drawn, one in its pop is drawn bold and scaled up about its own centre
++ * (a drawing, so it grows over its neighbours and pushes none), and the rest
++ * are drawn as they are. Called from the draw phase, so a moving song
++ * redraws this and nothing else.
++ */
++private fun DrawScope.drawSungWords(
++    drawing: LineDrawing,
++    reveal: Reveal,
++    positionMs: Long,
++    color: Color,
++    measurer: TextMeasurer,
++) {
++    for (i in reveal.starts.indices) {
++        val t = positionMs - reveal.starts[i]
++        if (t < 0) continue
++        val box = drawing.boxes[i]
++        if (popping(reveal, i, positionMs)) {
++            val word = drawing.boldAt(i, measurer)
++            val center = box.center
++            val fade = (t.toFloat() / WORD_FADE_MS).coerceIn(0f, 1f)
++            val grow = popScale(reveal, i, positionMs)
++            withTransform({ scale(grow, grow, center) }) {
++                drawText(
++                    word,
++                    color = color.copy(alpha = fade),
++                    topLeft = Offset(
++                        center.x - word.size.width / 2f,
++                        center.y - word.size.height / 2f,
++                    ),
++                )
++            }
++        } else {
++            drawText(drawing.regularAt(i, measurer), color = color, topLeft = Offset(box.left, box.top))
++        }
++    }
++}
++
++
++@Composable
++private fun MessageBubble(
++    line: LyricLine,
++    endMs: Long?,
++    atEnd: Boolean,
++    grouped: Boolean,
++    place: String?,
++    newest: Boolean,
++    age: Int,
++    synced: Boolean,
++    isPlaying: Boolean,
++    positionMs: State<Long>,
++    measurer: TextMeasurer,
++    showTranslation: Boolean,
++    onClick: () -> Unit,
++) {
++    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
++
++    // Pops in once, when it is the line just reached. A bubble that comes
++    // into view by scrolling, or after a seek, is simply there.
++    val pop = remember { Animatable(if (newest) 0f else 1f) }
++    LaunchedEffect(Unit) {
++        if (pop.value < 1f) {
++            pop.animateTo(1f, spring(dampingRatio = 0.5f, stiffness = Spring.StiffnessMediumLow))
++        }
++    }
++
++    // The line being sung in full, the one before it a little quieter, and
++    // the older ones quieter still. Without sync every line is the same.
++    val dim by animateFloatAsState(
++        targetValue = when {
++            !synced || age <= 0 -> 1f
++            age == 1 -> 0.62f
++            else -> 0.42f
++        },
++        animationSpec = tween(300),
++        label = "messageDim",
++    )
++    // A thin outline on the line being sung.
++    val ring by animateFloatAsState(
++        targetValue = if (newest) 1f else 0f,
++        animationSpec = tween(250),
++        label = "messageRing",
++    )
++
++    val ink = GlassInk
++    val sung = if (atEnd) Color.White else ink
++    val fill = if (atEnd) SentBlue else ink.copy(alpha = 0.16f)
++
++    val round = 20.dp
++    val corner = 5.dp
++    val card = place != null && line.text.isNotBlank()
++    val shape = when {
++        card -> RoundedCornerShape(18.dp)
++        // Only the last of a run has the tail; the ones before it are round.
++        grouped -> RoundedCornerShape(round)
++        else -> RoundedCornerShape(
++            topStart = round,
++            topEnd = round,
++            bottomStart = if (atEnd) round else corner,
++            bottomEnd = if (atEnd) corner else round,
++        )
++    }
++
++    Row(
++        Modifier
++            .fillMaxWidth()
++            .padding(bottom = if (grouped) 2.dp else 8.dp),
++        horizontalArrangement = if (atEnd) Arrangement.End else Arrangement.Start,
++    ) {
++        Column(
++            Modifier
++                .then(if (card) Modifier.width(264.dp) else Modifier.widthIn(max = 300.dp))
++                .graphicsLayer {
++                    val p = pop.value
++                    alpha = p.coerceIn(0f, 1f) * dim
++                    val scale = 0.7f + 0.3f * p
++                    scaleX = scale
++                    scaleY = scale
++                    // Rises into place from below, and bounces past it.
++                    translationY = (1f - p) * 24.dp.toPx()
++                    // Grows out of the corner its tail is on.
++                    transformOrigin = TransformOrigin(if (atEnd != rtl) 1f else 0f, 1f)
++                }
++                .clip(shape)
++                .background(fill)
++                .border(1.dp, sung.copy(alpha = 0.4f * ring), shape)
++                .clickable(enabled = line.startTimeMs != null, onClick = onClick),
++        ) {
++            if (card) MapHeader(place!!)
++            Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
++                if (line.text.isBlank()) {
++                    TypingDots(sung)
++                } else {
++                    // Only the line being sung reads the position, so only it
++                    // redraws as the song moves.
++                    val timed = synced && newest
++                    // Only the line being sung needs its words timed.
++                    val reveal = remember(line, endMs, timed) {
++                        if (timed) revealOf(line, endMs) else null
++                    }
++                    val drawing = remember { LineDrawing() }
++                    val clock = rememberFrameClock(positionMs, timed && isPlaying)
++                    // Where the words of the line ended up. Not state: nothing
++                    // should recompose when it is set.
++                    val layoutHolder = remember { arrayOfNulls<TextLayoutResult>(1) }
++                    val textStyle = MaterialTheme.typography.bodyLarge.copy(
++                        fontSize = 18.sp,
++                        lineHeight = 24.sp,
++                        fontWeight = FontWeight.Medium,
 +                    )
-+                    if (showTranslation && !line.translation.isNullOrBlank()) {
++                    // While the line is being sung this text is invisible: it
++                    // only gives the bubble its size and the words their
++                    // places. The words are drawn over it, one by one, as
++                    // they are sung (see drawSungWords).
++                    Text(
++                        line.text,
++                        style = textStyle,
++                        color = if (timed) Color.Transparent else sung,
++                        onTextLayout = { layoutHolder[0] = it },
++                        modifier = if (reveal != null) {
++                            Modifier.drawWithContent {
++                                drawContent()
++                                val layout = layoutHolder[0]
++                                if (layout != null) {
++                                    if (drawing.layout !== layout) {
++                                        drawing.build(layout, line, reveal, textStyle)
++                                    }
++                                    drawSungWords(drawing, reveal, clock.value, sung, measurer)
++                                }
++                            }
++                        } else {
++                            Modifier
++                        },
++                    )
++                    if (card) {
++                        Row(
++                            verticalAlignment = Alignment.CenterVertically,
++                            modifier = Modifier.padding(top = 4.dp),
++                        ) {
++                            Box(
++                                Modifier
++                                    .size(9.dp)
++                                    .background(Color(0xFFEA4335), CircleShape),
++                            )
++                            Text(
++                                place!!,
++                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
++                                color = sung.copy(alpha = 0.75f),
++                                modifier = Modifier.padding(start = 6.dp),
++                            )
++                        }
++                    }
++                    val translation = line.translation.takeIf { showTranslation && !it.isNullOrBlank() }
++                    if (translation != null) {
 +                        Text(
-+                            line.translation.orEmpty(),
-+                            color = Color.White.copy(alpha = 0.65f),
-+                            style = MaterialTheme.typography.bodySmall,
-+                            modifier = Modifier.padding(top = 5.dp),
++                            translation,
++                            style = MaterialTheme.typography.bodyMedium,
++                            color = sung.copy(alpha = 0.7f),
++                            modifier = Modifier.padding(top = 3.dp),
 +                        )
 +                    }
 +                }
@@ -247,40 +1109,451 @@ index 0000000..92262e1
 +        }
 +    }
 +}
++
++/**
++ * The picture at the top of a map card: a little drawn map, a different one
++ * for each place, with a pin on it. Nothing is downloaded.
++ */
++@Composable
++private fun MapHeader(place: String) {
++    val seed = place.hashCode()
++    // Moves the pin and the roads about a little, so two places do not look
++    // like the same map.
++    val shift = ((seed and 0x7fffffff) % 40) / 100f
++    Box(
++        Modifier
++            .fillMaxWidth()
++            .height(72.dp),
++    ) {
++        Canvas(Modifier.fillMaxSize()) {
++            val w = size.width
++            val h = size.height
++            drawRect(Color(0xFFE9E5DA))
++            drawRect(
++                Color(0xFFCFE3C2),
++                topLeft = Offset(w * (0.50f + shift / 2f), h * 0.08f),
++                size = Size(w * 0.30f, h * 0.42f),
++            )
++            drawRect(
++                Color(0xFFBFD9EA),
++                topLeft = Offset(0f, h * 0.76f),
++                size = Size(w, h * 0.24f),
++            )
++            val road = Color.White
++            drawLine(road, Offset(0f, h * (0.30f + shift / 2f)), Offset(w, h * 0.18f), strokeWidth = 9f)
++            drawLine(road, Offset(w * (0.20f + shift / 2f), 0f), Offset(w * 0.42f, h), strokeWidth = 7f)
++            drawLine(road, Offset(w * 0.78f, 0f), Offset(w * (0.66f + shift / 3f), h * 0.76f), strokeWidth = 5f)
++            val pin = Offset(w * (0.30f + shift), h * 0.46f)
++            drawCircle(Color(0xFFEA4335), radius = h * 0.13f, center = pin)
++            drawCircle(Color.White, radius = h * 0.05f, center = pin)
++        }
++        Text(
++            "Maps",
++            color = Color.White,
++            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
++            modifier = Modifier
++                .padding(8.dp)
++                .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
++                .padding(horizontal = 6.dp, vertical = 2.dp),
++        )
++    }
++}
++
++/** The three dots of someone typing, for a gap in the song. */
++@Composable
++private fun TypingDots(color: Color) {
++    val transition = rememberInfiniteTransition(label = "typing")
++    Row(
++        horizontalArrangement = Arrangement.spacedBy(5.dp),
++        modifier = Modifier.padding(vertical = 6.dp),
++    ) {
++        repeat(3) { dot ->
++            val level by transition.animateFloat(
++                initialValue = 0.3f,
++                targetValue = 1f,
++                animationSpec = infiniteRepeatable(
++                    animation = tween(480, delayMillis = dot * 160, easing = LinearEasing),
++                    repeatMode = RepeatMode.Reverse,
++                ),
++                label = "typingDot$dot",
++            )
++            Box(
++                Modifier
++                    .size(8.dp)
++                    .graphicsLayer { alpha = level }
++                    .background(color, CircleShape),
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt b/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt
+new file mode 100644
+index 0000000..5dbbab5
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt
+@@ -0,0 +1,172 @@
++package dev.lelonio.square.ui.player
++
++/**
++ * Spots a well-known place in a line of lyrics, for the map card in
++ * [MessagesLyricsView].
++ *
++ * There is no network and no geocoder behind this: it is a short list of
++ * landmarks and big cities, matched as whole words. That keeps it instant and
++ * private, and it means a place that is not on the list simply gets no card.
++ * Names that are mostly somebody's name in a song (Paris, Austin, Jordan,
++ * Houston...) are left out on purpose, so a card is rarely wrong.
++ *
++ * Add a place by adding a `"what is sung" to "Name, Region"` pair below.
++ */
++private val placeList: List<Pair<String, String>> = listOf(
++    // New York
++    "brooklyn bridge" to "Brooklyn Bridge, New York",
++    "times square" to "Times Square, New York",
++    "central park" to "Central Park, New York",
++    "madison square garden" to "Madison Square Garden, New York",
++    "statue of liberty" to "Statue of Liberty, New York",
++    "empire state building" to "Empire State Building, New York",
++    "wall street" to "Wall Street, New York",
++    "coney island" to "Coney Island, New York",
++    "yankee stadium" to "Yankee Stadium, New York",
++    "brooklyn" to "Brooklyn, New York",
++    "manhattan" to "Manhattan, New York",
++    "harlem" to "Harlem, New York",
++    "the bronx" to "The Bronx, New York",
++    "new york" to "New York, USA",
++    "nyc" to "New York, USA",
++    // California
++    "hollywood" to "Hollywood, Los Angeles",
++    "beverly hills" to "Beverly Hills, California",
++    "rodeo drive" to "Rodeo Drive, Beverly Hills",
++    "sunset boulevard" to "Sunset Boulevard, Los Angeles",
++    "sunset strip" to "Sunset Strip, Los Angeles",
++    "santa monica" to "Santa Monica, California",
++    "venice beach" to "Venice Beach, Los Angeles",
++    "malibu" to "Malibu, California",
++    "compton" to "Compton, California",
++    "long beach" to "Long Beach, California",
++    "golden gate bridge" to "Golden Gate Bridge, San Francisco",
++    "san francisco" to "San Francisco, California",
++    "san diego" to "San Diego, California",
++    "los angeles" to "Los Angeles, California",
++    "silicon valley" to "Silicon Valley, California",
++    // Rest of the USA
++    "las vegas" to "Las Vegas, Nevada",
++    "miami beach" to "Miami Beach, Florida",
++    "miami" to "Miami, Florida",
++    "south beach" to "South Beach, Miami",
++    "new orleans" to "New Orleans, Louisiana",
++    "atlanta" to "Atlanta, Georgia",
++    "chicago" to "Chicago, Illinois",
++    "detroit" to "Detroit, Michigan",
++    "memphis" to "Memphis, Tennessee",
++    "nashville" to "Nashville, Tennessee",
++    "seattle" to "Seattle, Washington",
++    "brooklyn heights" to "Brooklyn Heights, New York",
++    "the white house" to "The White House, Washington, D.C.",
++    "washington d.c." to "Washington, D.C.",
++    "hawaii" to "Hawaii, USA",
++    "alaska" to "Alaska, USA",
++    "texas" to "Texas, USA",
++    "florida" to "Florida, USA",
++    "california" to "California, USA",
++    "disneyland" to "Disneyland, California",
++    "grand canyon" to "Grand Canyon, Arizona",
++    "niagara falls" to "Niagara Falls, New York",
++    // Europe
++    "eiffel tower" to "Eiffel Tower, Paris",
++    "champs elysees" to "Champs-Élysées, Paris",
++    "paris" to "Paris, France",
++    "big ben" to "Big Ben, London",
++    "buckingham palace" to "Buckingham Palace, London",
++    "abbey road" to "Abbey Road, London",
++    "piccadilly" to "Piccadilly Circus, London",
++    "london" to "London, England",
++    "manchester" to "Manchester, England",
++    "liverpool" to "Liverpool, England",
++    "berlin" to "Berlin, Germany",
++    "amsterdam" to "Amsterdam, Netherlands",
++    "colosseum" to "Colosseum, Rome",
++    "rome" to "Rome, Italy",
++    "milan" to "Milan, Italy",
++    "venice" to "Venice, Italy",
++    "barcelona" to "Barcelona, Spain",
++    "madrid" to "Madrid, Spain",
++    "ibiza" to "Ibiza, Spain",
++    "monaco" to "Monaco",
++    "saint tropez" to "Saint-Tropez, France",
++    "st. tropez" to "Saint-Tropez, France",
++    "santorini" to "Santorini, Greece",
++    "moscow" to "Moscow, Russia",
++    "red square" to "Red Square, Moscow",
++    "stockholm" to "Stockholm, Sweden",
++    "dublin" to "Dublin, Ireland",
++    // Asia
++    "shibuya crossing" to "Shibuya Crossing, Tokyo",
++    "shibuya" to "Shibuya, Tokyo",
++    "shinjuku" to "Shinjuku, Tokyo",
++    "tokyo" to "Tokyo, Japan",
++    "kyoto" to "Kyoto, Japan",
++    "osaka" to "Osaka, Japan",
++    "seoul" to "Seoul, South Korea",
++    "gangnam" to "Gangnam, Seoul",
++    "busan" to "Busan, South Korea",
++    "beijing" to "Beijing, China",
++    "shanghai" to "Shanghai, China",
++    "hong kong" to "Hong Kong",
++    "bangkok" to "Bangkok, Thailand",
++    "singapore" to "Singapore",
++    "bali" to "Bali, Indonesia",
++    "dubai" to "Dubai, UAE",
++    "burj khalifa" to "Burj Khalifa, Dubai",
++    "taj mahal" to "Taj Mahal, Agra",
++    "india gate" to "India Gate, New Delhi",
++    "gateway of india" to "Gateway of India, Mumbai",
++    "marine drive" to "Marine Drive, Mumbai",
++    "mumbai" to "Mumbai, India",
++    "bombay" to "Mumbai, India",
++    "delhi" to "Delhi, India",
++    "bangalore" to "Bengaluru, India",
++    "bengaluru" to "Bengaluru, India",
++    "hyderabad" to "Hyderabad, India",
++    "chennai" to "Chennai, India",
++    "kolkata" to "Kolkata, India",
++    "punjab" to "Punjab, India",
++    "goa" to "Goa, India",
++    "kashmir" to "Kashmir, India",
++    "himalayas" to "Himalayas",
++    // The rest of the world
++    "sydney opera house" to "Sydney Opera House, Australia",
++    "bondi beach" to "Bondi Beach, Sydney",
++    "melbourne" to "Melbourne, Australia",
++    "toronto" to "Toronto, Canada",
++    "vancouver" to "Vancouver, Canada",
++    "mexico city" to "Mexico City, Mexico",
++    "cancun" to "Cancún, Mexico",
++    "havana" to "Havana, Cuba",
++    "rio de janeiro" to "Rio de Janeiro, Brazil",
++    "copacabana" to "Copacabana, Rio de Janeiro",
++    "sao paulo" to "São Paulo, Brazil",
++    "buenos aires" to "Buenos Aires, Argentina",
++    "kingston, jamaica" to "Kingston, Jamaica",
++    "jamaica" to "Jamaica",
++    "lagos" to "Lagos, Nigeria",
++    "nairobi" to "Nairobi, Kenya",
++    "cairo" to "Cairo, Egypt",
++    "johannesburg" to "Johannesburg, South Africa",
++    "cape town" to "Cape Town, South Africa",
++    "marrakech" to "Marrakech, Morocco",
++)
++
++/** Longest names first, so "Brooklyn Bridge" is found before "Brooklyn". */
++private val placeMatchers: List<Pair<Regex, String>> by lazy {
++    placeList
++        .sortedByDescending { it.first.length }
++        .map { (key, name) ->
++            Regex("(?<![a-z])" + Regex.escape(key) + "(?![a-z])") to name
++        }
++}
++
++/** The "Name, Region" of the first well-known place the [line] sings about, or null. */
++internal fun placeIn(line: String): String? {
++    val text = line.lowercase()
++    for ((matcher, name) in placeMatchers) {
++        if (matcher.containsMatchIn(text)) return name
++    }
++    return null
++}
 diff --git a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
-index c14d071..302af65 100644
+index c14d071..f5a7a25 100644
 --- a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
 +++ b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
-@@ -3017,6 +3017,22 @@ private fun LyricsStage(
+@@ -3017,6 +3017,32 @@ private fun LyricsStage(
                  color = GlassInkDim,
              )
  
-+            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CONSTELLATION -> ConstellationLyricsView(
-+                lyrics = shown ?: lyrics,
-+                positionMs = heardMs,
-+                showTranslation = translated || romanized,
-+                onSeek = seekHeard,
-+                modifier = Modifier.fillMaxSize(),
-+            )
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CONSTELLATION -> CompositionLocalProvider(
++                LocalLayoutDirection provides songDirection,
++            ) {
++                ConstellationLyricsView(
++                    lyrics = shown ?: lyrics,
++                    positionMs = heardMs,
++                    isPlaying = isPlaying,
++                    showTranslation = translated || romanized,
++                    onSeek = seekHeard,
++                    modifier = Modifier.fillMaxSize(),
++                )
++            }
 +
-+            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.MESSAGES -> MessagesLyricsView(
-+                lyrics = shown ?: lyrics,
-+                positionMs = heardMs,
-+                showTranslation = translated || romanized,
-+                onSeek = seekHeard,
-+                modifier = Modifier.fillMaxSize(),
-+            )
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.MESSAGES -> CompositionLocalProvider(
++                LocalLayoutDirection provides songDirection,
++            ) {
++                MessagesLyricsView(
++                    lyrics = shown ?: lyrics,
++                    positionMs = heardMs,
++                    isPlaying = isPlaying,
++                    showTranslation = translated || romanized,
++                    onSeek = seekHeard,
++                    modifier = Modifier.fillMaxSize(),
++                )
++            }
 +
              style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CLASSIC -> CompositionLocalProvider(
                  LocalLayoutDirection provides songDirection,
              ) {
+diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
+index 38bf337..f6a59e8 100644
+--- a/app/src/main/res/values-de/strings.xml
++++ b/app/src/main/res/values-de/strings.xml
+@@ -591,6 +591,8 @@
+     <string name="lyrics_style_title">Stil</string>
+     <string name="lyrics_style_animated">Animiert</string>
+     <string name="lyrics_style_classic">Klassisch</string>
++    <string name="lyrics_style_messages">Nachrichten</string>
++    <string name="lyrics_style_constellation">Sterne</string>
+     <string name="lyrics_word">Wort für Wort</string>
+     <string name="lyrics_line">Zeilenweise</string>
+     <string name="lyrics_unsynced">Nicht synchron</string>
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index db8096b..9d7b194 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -597,6 +597,8 @@
+     <string name="lyrics_style_title">Estilo</string>
+     <string name="lyrics_style_animated">Animado</string>
+     <string name="lyrics_style_classic">Clásico</string>
++    <string name="lyrics_style_messages">Mensajes</string>
++    <string name="lyrics_style_constellation">Estrellas</string>
+     <string name="lyrics_word">Palabra por palabra</string>
+     <string name="lyrics_line">Por línea</string>
+     <string name="lyrics_unsynced">Sin sincronizar</string>
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index c18b6f4..a1b80cb 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -591,6 +591,8 @@
+     <string name="lyrics_style_title">Style</string>
+     <string name="lyrics_style_animated">Animé</string>
+     <string name="lyrics_style_classic">Classique</string>
++    <string name="lyrics_style_messages">Messages</string>
++    <string name="lyrics_style_constellation">Étoiles</string>
+     <string name="lyrics_word">Mot à mot</string>
+     <string name="lyrics_line">Par ligne</string>
+     <string name="lyrics_unsynced">Non synchronisées</string>
+diff --git a/app/src/main/res/values-hi/strings.xml b/app/src/main/res/values-hi/strings.xml
+index ef0c592..d0044ef 100644
+--- a/app/src/main/res/values-hi/strings.xml
++++ b/app/src/main/res/values-hi/strings.xml
+@@ -606,6 +606,8 @@
+     <string name="lyrics_style_title">शैली</string>
+     <string name="lyrics_style_animated">एनिमेटेड</string>
+     <string name="lyrics_style_classic">क्लासिक</string>
++    <string name="lyrics_style_messages">संदेश</string>
++    <string name="lyrics_style_constellation">तारे</string>
+     <string name="lyrics_word">शब्द-दर-शब्द</string>
+     <string name="lyrics_line">पंक्ति-दर-पंक्ति</string>
+     <string name="lyrics_unsynced">सिंक नहीं</string>
+diff --git a/app/src/main/res/values-it/strings.xml b/app/src/main/res/values-it/strings.xml
+index c2a79d5..e32dedb 100644
+--- a/app/src/main/res/values-it/strings.xml
++++ b/app/src/main/res/values-it/strings.xml
+@@ -630,6 +630,8 @@
+     <string name="lyrics_style_title">Stile</string>
+     <string name="lyrics_style_animated">Animato</string>
+     <string name="lyrics_style_classic">Classico</string>
++    <string name="lyrics_style_messages">Messaggi</string>
++    <string name="lyrics_style_constellation">Stelle</string>
+     <string name="lyrics_word">Parola per parola</string>
+     <string name="lyrics_line">Per riga</string>
+     <string name="lyrics_unsynced">Non sincronizzato</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index e3dac9a..6149b92 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -647,6 +647,8 @@
+     <string name="lyrics_style_title">表示スタイル</string>
+     <string name="lyrics_style_animated">アニメーション</string>
+     <string name="lyrics_style_classic">クラシック</string>
++    <string name="lyrics_style_messages">メッセージ</string>
++    <string name="lyrics_style_constellation">星空</string>
+     <string name="lyrics_word">単語単位で同期</string>
+     <string name="lyrics_line">行単位で同期</string>
+     <string name="lyrics_unsynced">未同期</string>
+diff --git a/app/src/main/res/values-ko/strings.xml b/app/src/main/res/values-ko/strings.xml
+index 977a563..27880ba 100644
+--- a/app/src/main/res/values-ko/strings.xml
++++ b/app/src/main/res/values-ko/strings.xml
+@@ -615,6 +615,8 @@
+     <string name="lyrics_style_title">스타일</string>
+     <string name="lyrics_style_animated">애니메이션</string>
+     <string name="lyrics_style_classic">클래식</string>
++    <string name="lyrics_style_messages">메시지</string>
++    <string name="lyrics_style_constellation">별</string>
+     <string name="lyrics_word">단어별</string>
+     <string name="lyrics_line">줄별</string>
+     <string name="lyrics_unsynced">동기화되지 않음</string>
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index 361732e..658628c 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -591,6 +591,8 @@
+     <string name="lyrics_style_title">Estilo</string>
+     <string name="lyrics_style_animated">Animado</string>
+     <string name="lyrics_style_classic">Clássico</string>
++    <string name="lyrics_style_messages">Mensagens</string>
++    <string name="lyrics_style_constellation">Estrelas</string>
+     <string name="lyrics_word">Palavra por palavra</string>
+     <string name="lyrics_line">Por linha</string>
+     <string name="lyrics_unsynced">Não sincronizada</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index fb1540b..686d54a 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -620,6 +620,8 @@
+     <string name="lyrics_style_title">Стиль</string>
+     <string name="lyrics_style_animated">Анимированный</string>
+     <string name="lyrics_style_classic">Классический</string>
++    <string name="lyrics_style_messages">Сообщения</string>
++    <string name="lyrics_style_constellation">Звёзды</string>
+     <string name="lyrics_word">По словам</string>
+     <string name="lyrics_line">По строкам</string>
+     <string name="lyrics_unsynced">Без синхронизации</string>
+diff --git a/app/src/main/res/values-tr/strings.xml b/app/src/main/res/values-tr/strings.xml
+index aea6194..ac80748 100644
+--- a/app/src/main/res/values-tr/strings.xml
++++ b/app/src/main/res/values-tr/strings.xml
+@@ -604,6 +604,8 @@
+     <string name="lyrics_style_title">Stil</string>
+     <string name="lyrics_style_animated">Animasyonlu</string>
+     <string name="lyrics_style_classic">Klasik</string>
++    <string name="lyrics_style_messages">Mesajlar</string>
++    <string name="lyrics_style_constellation">Yıldızlar</string>
+     <string name="lyrics_word">Kelime kelime</string>
+     <string name="lyrics_line">Satır satır</string>
+     <string name="lyrics_unsynced">Senkronize değil</string>
+diff --git a/app/src/main/res/values-vi/strings.xml b/app/src/main/res/values-vi/strings.xml
+index 29e1407..46a77ce 100644
+--- a/app/src/main/res/values-vi/strings.xml
++++ b/app/src/main/res/values-vi/strings.xml
+@@ -650,6 +650,8 @@
+     <string name="lyrics_style_title">Kiểu</string>
+     <string name="lyrics_style_animated">Động</string>
+     <string name="lyrics_style_classic">Cổ điển</string>
++    <string name="lyrics_style_messages">Tin nhắn</string>
++    <string name="lyrics_style_constellation">Sao</string>
+     <string name="lyrics_word">Theo từng từ</string>
+     <string name="lyrics_line">Theo từng dòng</string>
+     <string name="lyrics_unsynced">Chưa đồng bộ</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index da3b819..f1278e8 100644
+index da3b819..19dd6ce 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -732,4 +732,4 @@
-     <string name="lyrics_folder_choose">Choose your music folder</string>
-     <string name="lyrics_folder_forget">Forget the folder</string>
-     <string name="lyrics_folder_note">Square shows an .lrc file with the same name as the song beside it, like song.mp3 and song.lrc. From Android 13 it needs to be shown the folder your music is in. Lyrics written into the song’s tags are read without it.</string>
--</resources>
-+    <string name="lyrics_style_constellation">Constellation</string>\n    <string name="lyrics_style_messages">Messages</string>\n</resources>
+@@ -657,6 +657,8 @@
+     <string name="lyrics_style_title">Style</string>
+     <string name="lyrics_style_animated">Animated</string>
+     <string name="lyrics_style_classic">Classic</string>
++    <string name="lyrics_style_messages">Messages</string>
++    <string name="lyrics_style_constellation">Stars</string>
+     <string name="lyrics_word">Word by word</string>
+     <string name="lyrics_line">By line</string>
+     <string name="lyrics_unsynced">Not synced</string>
