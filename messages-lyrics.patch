@@ -1,248 +1,286 @@
 diff --git a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
-index 3e41048..c7f1cc1 100644
+index 3e41048..963b7db 100644
 --- a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
 +++ b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
-@@ -127,8 +127,13 @@ class PreferencesStore(context: Context) {
-         prefs.edit().putString(KEY_PREFERRED_LYRICS, value).apply()
+@@ -128,7 +128,7 @@ class PreferencesStore(context: Context) {
      }
  
--    /** How the lyrics are drawn: animated word by word, or as plain lines. */
+     /** How the lyrics are drawn: animated word by word, or as plain lines. */
 -    enum class LyricsStyle { ANIMATED, CLASSIC }
-+    /**
-+     * How the lyrics are drawn: animated word by word, as plain lines, or as a
-+     * chat that fills with message bubbles as the song is sung, or as a
-+     * constellation whose stars are lit by the words, which turns the phone
-+     * onto its side.
-+     */
-+    enum class LyricsStyle { ANIMATED, CLASSIC, MESSAGES, CONSTELLATION }
++    enum class LyricsStyle { ANIMATED, CLASSIC, CONSTELLATION, MESSAGES }
  
      private val _lyricsStyle = MutableStateFlow(
          LyricsStyle.entries.firstOrNull { it.name == prefs.getString(KEY_LYRICS_STYLE, null) } ?: LyricsStyle.ANIMATED,
-diff --git a/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
-index 7a0f1ac..136270b 100644
---- a/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
-+++ b/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
-@@ -151,7 +151,7 @@ fun ClassicLyricsView(
- }
- 
- /** Where each timed word sits in the line's text, found in order; null for one not found. */
--private fun wordRanges(line: LyricLine): List<IntRange?> {
-+internal fun wordRanges(line: LyricLine): List<IntRange?> {
-     var cursor = 0
-     return line.words.map { word ->
-         val at = line.text.indexOf(word.text, cursor)
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt
+new file mode 100644
+index 0000000..4038703
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt
+@@ -0,0 +1,117 @@
++package dev.lelonio.square.ui.player
++
++import android.content.pm.ActivityInfo
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import android.app.Activity
++import dev.lelonio.square.data.Lyrics
++
++/**
++ * Wide, centered lyric presentation. This mode deliberately uses landscape
++ * while visible and restores portrait when the user leaves it.
++ */
++@Composable
++fun ConstellationLyricsView(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    showTranslation: Boolean,
++    onSeek: (Long) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val context = LocalContext.current
++    DisposableEffect(context) {
++        val activity = context.findActivity()
++        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
++        onDispose {
++            // The player returns to its normal portrait presentation so the
++            // user can choose another lyrics mode without rotating manually.
++            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
++        }
++    }
++
++    val active = remember(lyrics, positionMs.value) {
++        lyrics.lines.indexOfLast { (it.startTimeMs ?: 0L) <= positionMs.value }
++    }.coerceIn(0, (lyrics.lines.size - 1).coerceAtLeast(0))
++
++    Box(
++        modifier = modifier
++            .fillMaxSize()
++            .background(Brush.radialGradient(listOf(Color(0xFF25365C), Color(0xFF080D1B)))),
++        contentAlignment = Alignment.Center,
++    ) {
++        Canvas(Modifier.fillMaxSize()) {
++            val stars = listOf(
++                0.08f to 0.18f, 0.19f to 0.72f, 0.31f to 0.27f, 0.43f to 0.82f,
++                0.57f to 0.14f, 0.68f to 0.66f, 0.81f to 0.31f, 0.92f to 0.78f,
++                0.75f to 0.88f, 0.12f to 0.91f, 0.49f to 0.48f,
++            )
++            stars.forEachIndexed { index, (x, y) ->
++                drawCircle(
++                    color = Color.White.copy(alpha = if (index % 3 == 0) 0.85f else 0.35f),
++                    radius = if (index % 3 == 0) 2.2.dp.toPx() else 1.2.dp.toPx(),
++                    center = androidx.compose.ui.geometry.Offset(size.width * x, size.height * y),
++                )
++            }
++        }
++        if (lyrics.lines.isNotEmpty()) {
++            Column(
++                modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp),
++                horizontalAlignment = Alignment.CenterHorizontally,
++                verticalArrangement = Arrangement.spacedBy(12.dp),
++            ) {
++                listOf(active - 1, active, active + 1).forEach { index ->
++                    val line = lyrics.lines.getOrNull(index) ?: return@forEach
++                    val focused = index == active
++                    Text(
++                        text = line.text.ifBlank { "♪" },
++                        color = Color.White.copy(alpha = if (focused) 1f else 0.38f),
++                        fontSize = if (focused) 30.sp else 19.sp,
++                        lineHeight = if (focused) 38.sp else 26.sp,
++                        fontWeight = if (focused) FontWeight.Bold else FontWeight.Medium,
++                        textAlign = TextAlign.Center,
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .clickable { line.startTimeMs?.let(onSeek) }
++                            .padding(vertical = 4.dp),
++                    )
++                    if (focused && showTranslation && !line.translation.isNullOrBlank()) {
++                        Text(
++                            line.translation.orEmpty(),
++                            color = Color.White.copy(alpha = 0.68f),
++                            style = MaterialTheme.typography.bodyLarge,
++                            textAlign = TextAlign.Center,
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++private tailrec fun android.content.Context.findActivity(): Activity? = when (this) {
++    is Activity -> this
++    is android.content.ContextWrapper -> baseContext.findActivity()
++    else -> null
++}
 diff --git a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
-index cd955be..beb3d8e 100644
+index cd955be..6f0996a 100644
 --- a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
 +++ b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
-@@ -232,8 +232,8 @@ fun LyricsOptionsPanel(
-                     }
-                 }
-                 Heading(stringResource(R.string.lyrics_style_title), top = 10.dp)
--                // Two side by side, on one line: a choice of two does not need
--                // two rows, and the panel has to fit the lyrics' own space.
-+                // Side by side, on one line: a choice of three short names does not need
-+                // three rows, and the panel has to fit the lyrics' own space.
-                 Row(
-                     Modifier.padding(horizontal = 18.dp),
-                     horizontalArrangement = Arrangement.spacedBy(8.dp),
 @@ -245,6 +245,8 @@ fun LyricsOptionsPanel(
                                  when (option) {
                                      LyricsStyle.ANIMATED -> R.string.lyrics_style_animated
                                      LyricsStyle.CLASSIC -> R.string.lyrics_style_classic
-+                                    LyricsStyle.MESSAGES -> R.string.lyrics_style_messages
 +                                    LyricsStyle.CONSTELLATION -> R.string.lyrics_style_constellation
++                                    LyricsStyle.MESSAGES -> R.string.lyrics_style_messages
                                  },
                              ),
                              style = MaterialTheme.typography.bodyMedium,
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+new file mode 100644
+index 0000000..92262e1
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+@@ -0,0 +1,94 @@
++package dev.lelonio.square.ui.player
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.State
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import dev.lelonio.square.data.Lyrics
++
++/** A conversational, message-bubble presentation of the lyric lines. */
++@Composable
++fun MessagesLyricsView(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    showTranslation: Boolean,
++    onSeek: (Long) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val activeLine = remember(lyrics, positionMs.value) {
++        // Binary search keeps playback updates inexpensive on long lyric sheets.
++        var low = 0
++        var high = lyrics.lines.size
++        while (low < high) {
++            val mid = (low + high) ushr 1
++            if ((lyrics.lines[mid].startTimeMs ?: 0L) <= positionMs.value) low = mid + 1
++            else high = mid
++        }
++        low - 1
++    }
++
++    LazyColumn(
++        modifier = modifier.fillMaxSize().padding(horizontal = 18.dp),
++        verticalArrangement = Arrangement.spacedBy(12.dp),
++        horizontalAlignment = Alignment.Start,
++    ) {
++        itemsIndexed(lyrics.lines) { index, line ->
++            val active = index == activeLine
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = if (index % 2 == 0) Arrangement.Start else Arrangement.End,
++            ) {
++                Column(
++                    modifier = Modifier
++                        .fillMaxWidth(0.88f)
++                        .clip(
++                            RoundedCornerShape(
++                                topStart = 20.dp, topEnd = 20.dp,
++                                bottomEnd = if (index % 2 == 0) 20.dp else 5.dp,
++                                bottomStart = if (index % 2 == 0) 5.dp else 20.dp,
++                            ),
++                        )
++                        .background(
++                            if (active) Color(0xFF315B75) else Color(0xFF202A35),
++                        )
++                        .clickable { line.startTimeMs?.let(onSeek) }
++                        .padding(horizontal = 16.dp, vertical = 12.dp),
++                ) {
++                    Text(
++                        line.text.ifBlank { "♪" },
++                        color = Color.White.copy(alpha = if (active) 1f else 0.72f),
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
++                    )
++                    if (showTranslation && !line.translation.isNullOrBlank()) {
++                        Text(
++                            line.translation.orEmpty(),
++                            color = Color.White.copy(alpha = 0.65f),
++                            style = MaterialTheme.typography.bodySmall,
++                            modifier = Modifier.padding(top = 5.dp),
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
 diff --git a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
-index c14d071..4396845 100644
+index c14d071..302af65 100644
 --- a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
 +++ b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
-@@ -3017,6 +3017,30 @@ private fun LyricsStage(
+@@ -3017,6 +3017,22 @@ private fun LyricsStage(
                  color = GlassInkDim,
              )
  
-+            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CONSTELLATION -> CompositionLocalProvider(
-+                LocalLayoutDirection provides songDirection,
-+            ) {
-+                ConstellationLyricsView(
-+                    lyrics = shown ?: lyrics,
-+                    positionMs = heardMs,
-+                    showTranslation = translated || romanized,
-+                    onSeek = seekHeard,
-+                    modifier = Modifier.fillMaxSize(),
-+                )
-+            }
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CONSTELLATION -> ConstellationLyricsView(
++                lyrics = shown ?: lyrics,
++                positionMs = heardMs,
++                showTranslation = translated || romanized,
++                onSeek = seekHeard,
++                modifier = Modifier.fillMaxSize(),
++            )
 +
-+            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.MESSAGES -> CompositionLocalProvider(
-+                LocalLayoutDirection provides songDirection,
-+            ) {
-+                MessagesLyricsView(
-+                    lyrics = shown ?: lyrics,
-+                    positionMs = heardMs,
-+                    showTranslation = translated || romanized,
-+                    onSeek = seekHeard,
-+                    modifier = Modifier.fillMaxSize(),
-+                )
-+            }
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.MESSAGES -> MessagesLyricsView(
++                lyrics = shown ?: lyrics,
++                positionMs = heardMs,
++                showTranslation = translated || romanized,
++                onSeek = seekHeard,
++                modifier = Modifier.fillMaxSize(),
++            )
 +
              style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CLASSIC -> CompositionLocalProvider(
                  LocalLayoutDirection provides songDirection,
              ) {
-diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
-index 38bf337..f6a59e8 100644
---- a/app/src/main/res/values-de/strings.xml
-+++ b/app/src/main/res/values-de/strings.xml
-@@ -591,6 +591,8 @@
-     <string name="lyrics_style_title">Stil</string>
-     <string name="lyrics_style_animated">Animiert</string>
-     <string name="lyrics_style_classic">Klassisch</string>
-+    <string name="lyrics_style_messages">Nachrichten</string>
-+    <string name="lyrics_style_constellation">Sterne</string>
-     <string name="lyrics_word">Wort für Wort</string>
-     <string name="lyrics_line">Zeilenweise</string>
-     <string name="lyrics_unsynced">Nicht synchron</string>
-diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
-index db8096b..9d7b194 100644
---- a/app/src/main/res/values-es/strings.xml
-+++ b/app/src/main/res/values-es/strings.xml
-@@ -597,6 +597,8 @@
-     <string name="lyrics_style_title">Estilo</string>
-     <string name="lyrics_style_animated">Animado</string>
-     <string name="lyrics_style_classic">Clásico</string>
-+    <string name="lyrics_style_messages">Mensajes</string>
-+    <string name="lyrics_style_constellation">Estrellas</string>
-     <string name="lyrics_word">Palabra por palabra</string>
-     <string name="lyrics_line">Por línea</string>
-     <string name="lyrics_unsynced">Sin sincronizar</string>
-diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
-index c18b6f4..a1b80cb 100644
---- a/app/src/main/res/values-fr/strings.xml
-+++ b/app/src/main/res/values-fr/strings.xml
-@@ -591,6 +591,8 @@
-     <string name="lyrics_style_title">Style</string>
-     <string name="lyrics_style_animated">Animé</string>
-     <string name="lyrics_style_classic">Classique</string>
-+    <string name="lyrics_style_messages">Messages</string>
-+    <string name="lyrics_style_constellation">Étoiles</string>
-     <string name="lyrics_word">Mot à mot</string>
-     <string name="lyrics_line">Par ligne</string>
-     <string name="lyrics_unsynced">Non synchronisées</string>
-diff --git a/app/src/main/res/values-hi/strings.xml b/app/src/main/res/values-hi/strings.xml
-index ef0c592..d0044ef 100644
---- a/app/src/main/res/values-hi/strings.xml
-+++ b/app/src/main/res/values-hi/strings.xml
-@@ -606,6 +606,8 @@
-     <string name="lyrics_style_title">शैली</string>
-     <string name="lyrics_style_animated">एनिमेटेड</string>
-     <string name="lyrics_style_classic">क्लासिक</string>
-+    <string name="lyrics_style_messages">संदेश</string>
-+    <string name="lyrics_style_constellation">तारे</string>
-     <string name="lyrics_word">शब्द-दर-शब्द</string>
-     <string name="lyrics_line">पंक्ति-दर-पंक्ति</string>
-     <string name="lyrics_unsynced">सिंक नहीं</string>
-diff --git a/app/src/main/res/values-it/strings.xml b/app/src/main/res/values-it/strings.xml
-index c2a79d5..e32dedb 100644
---- a/app/src/main/res/values-it/strings.xml
-+++ b/app/src/main/res/values-it/strings.xml
-@@ -630,6 +630,8 @@
-     <string name="lyrics_style_title">Stile</string>
-     <string name="lyrics_style_animated">Animato</string>
-     <string name="lyrics_style_classic">Classico</string>
-+    <string name="lyrics_style_messages">Messaggi</string>
-+    <string name="lyrics_style_constellation">Stelle</string>
-     <string name="lyrics_word">Parola per parola</string>
-     <string name="lyrics_line">Per riga</string>
-     <string name="lyrics_unsynced">Non sincronizzato</string>
-diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
-index e3dac9a..6149b92 100644
---- a/app/src/main/res/values-ja/strings.xml
-+++ b/app/src/main/res/values-ja/strings.xml
-@@ -647,6 +647,8 @@
-     <string name="lyrics_style_title">表示スタイル</string>
-     <string name="lyrics_style_animated">アニメーション</string>
-     <string name="lyrics_style_classic">クラシック</string>
-+    <string name="lyrics_style_messages">メッセージ</string>
-+    <string name="lyrics_style_constellation">星空</string>
-     <string name="lyrics_word">単語単位で同期</string>
-     <string name="lyrics_line">行単位で同期</string>
-     <string name="lyrics_unsynced">未同期</string>
-diff --git a/app/src/main/res/values-ko/strings.xml b/app/src/main/res/values-ko/strings.xml
-index 977a563..27880ba 100644
---- a/app/src/main/res/values-ko/strings.xml
-+++ b/app/src/main/res/values-ko/strings.xml
-@@ -615,6 +615,8 @@
-     <string name="lyrics_style_title">스타일</string>
-     <string name="lyrics_style_animated">애니메이션</string>
-     <string name="lyrics_style_classic">클래식</string>
-+    <string name="lyrics_style_messages">메시지</string>
-+    <string name="lyrics_style_constellation">별</string>
-     <string name="lyrics_word">단어별</string>
-     <string name="lyrics_line">줄별</string>
-     <string name="lyrics_unsynced">동기화되지 않음</string>
-diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
-index 361732e..658628c 100644
---- a/app/src/main/res/values-pt/strings.xml
-+++ b/app/src/main/res/values-pt/strings.xml
-@@ -591,6 +591,8 @@
-     <string name="lyrics_style_title">Estilo</string>
-     <string name="lyrics_style_animated">Animado</string>
-     <string name="lyrics_style_classic">Clássico</string>
-+    <string name="lyrics_style_messages">Mensagens</string>
-+    <string name="lyrics_style_constellation">Estrelas</string>
-     <string name="lyrics_word">Palavra por palavra</string>
-     <string name="lyrics_line">Por linha</string>
-     <string name="lyrics_unsynced">Não sincronizada</string>
-diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
-index fb1540b..686d54a 100644
---- a/app/src/main/res/values-ru/strings.xml
-+++ b/app/src/main/res/values-ru/strings.xml
-@@ -620,6 +620,8 @@
-     <string name="lyrics_style_title">Стиль</string>
-     <string name="lyrics_style_animated">Анимированный</string>
-     <string name="lyrics_style_classic">Классический</string>
-+    <string name="lyrics_style_messages">Сообщения</string>
-+    <string name="lyrics_style_constellation">Звёзды</string>
-     <string name="lyrics_word">По словам</string>
-     <string name="lyrics_line">По строкам</string>
-     <string name="lyrics_unsynced">Без синхронизации</string>
-diff --git a/app/src/main/res/values-tr/strings.xml b/app/src/main/res/values-tr/strings.xml
-index aea6194..ac80748 100644
---- a/app/src/main/res/values-tr/strings.xml
-+++ b/app/src/main/res/values-tr/strings.xml
-@@ -604,6 +604,8 @@
-     <string name="lyrics_style_title">Stil</string>
-     <string name="lyrics_style_animated">Animasyonlu</string>
-     <string name="lyrics_style_classic">Klasik</string>
-+    <string name="lyrics_style_messages">Mesajlar</string>
-+    <string name="lyrics_style_constellation">Yıldızlar</string>
-     <string name="lyrics_word">Kelime kelime</string>
-     <string name="lyrics_line">Satır satır</string>
-     <string name="lyrics_unsynced">Senkronize değil</string>
-diff --git a/app/src/main/res/values-vi/strings.xml b/app/src/main/res/values-vi/strings.xml
-index 29e1407..46a77ce 100644
---- a/app/src/main/res/values-vi/strings.xml
-+++ b/app/src/main/res/values-vi/strings.xml
-@@ -650,6 +650,8 @@
-     <string name="lyrics_style_title">Kiểu</string>
-     <string name="lyrics_style_animated">Động</string>
-     <string name="lyrics_style_classic">Cổ điển</string>
-+    <string name="lyrics_style_messages">Tin nhắn</string>
-+    <string name="lyrics_style_constellation">Sao</string>
-     <string name="lyrics_word">Theo từng từ</string>
-     <string name="lyrics_line">Theo từng dòng</string>
-     <string name="lyrics_unsynced">Chưa đồng bộ</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index da3b819..19dd6ce 100644
+index da3b819..f1278e8 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -657,6 +657,8 @@
-     <string name="lyrics_style_title">Style</string>
-     <string name="lyrics_style_animated">Animated</string>
-     <string name="lyrics_style_classic">Classic</string>
-+    <string name="lyrics_style_messages">Messages</string>
-+    <string name="lyrics_style_constellation">Stars</string>
-     <string name="lyrics_word">Word by word</string>
-     <string name="lyrics_line">By line</string>
-     <string name="lyrics_unsynced">Not synced</string>
+@@ -732,4 +732,4 @@
+     <string name="lyrics_folder_choose">Choose your music folder</string>
+     <string name="lyrics_folder_forget">Forget the folder</string>
+     <string name="lyrics_folder_note">Square shows an .lrc file with the same name as the song beside it, like song.mp3 and song.lrc. From Android 13 it needs to be shown the folder your music is in. Lyrics written into the song’s tags are read without it.</string>
+-</resources>
++    <string name="lyrics_style_constellation">Constellation</string>\n    <string name="lyrics_style_messages">Messages</string>\n</resources>
