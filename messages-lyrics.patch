@@ -1,453 +1,36 @@
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt Square-master/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt	2026-11-23 13:19:09.764975935 +0000
-@@ -127,8 +127,13 @@
-         prefs.edit().putString(KEY_PREFERRED_LYRICS, value).apply()
-     }
- 
--    /** How the lyrics are drawn: animated word by word, or as plain lines. */
--    enum class LyricsStyle { ANIMATED, CLASSIC }
-+    /**
-+     * How the lyrics are drawn: animated word by word, as plain lines, or as a
-+     * chat that fills with message bubbles as the song is sung, or as a
-+     * constellation whose stars are lit by the words, which turns the phone
-+     * onto its side.
-+     */
+diff --git a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
+index 523914a..c7f1cc1 100644
+--- a/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
++++ b/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
+@@ -133,7 +133,7 @@ class PreferencesStore(context: Context) {
+      * constellation whose stars are lit by the words, which turns the phone
+      * onto its side.
+      */
+-    enum class LyricsStyle { ANIMATED, CLASSIC, CONSTELLATION }
 +    enum class LyricsStyle { ANIMATED, CLASSIC, MESSAGES, CONSTELLATION }
  
      private val _lyricsStyle = MutableStateFlow(
          LyricsStyle.entries.firstOrNull { it.name == prefs.getString(KEY_LYRICS_STYLE, null) } ?: LyricsStyle.ANIMATED,
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/ClassicLyricsView.kt	2026-11-23 13:19:09.765187968 +0000
-@@ -151,7 +151,7 @@
- }
- 
- /** Where each timed word sits in the line's text, found in order; null for one not found. */
--private fun wordRanges(line: LyricLine): List<IntRange?> {
-+internal fun wordRanges(line: LyricLine): List<IntRange?> {
-     var cursor = 0
-     return line.words.map { word ->
-         val at = line.text.indexOf(word.text, cursor)
-@@ -165,7 +165,7 @@
- }
- 
- /** The line, coloured as far as it has been sung at [positionMs]. */
--private fun sungSoFar(
-+internal fun sungSoFar(
-     line: LyricLine,
-     ranges: List<IntRange?>,
-     positionMs: Long,
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt	1970-01-01 00:00:00.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/ConstellationLyricsView.kt	2026-11-23 13:19:22.730365788 +0000
-@@ -0,0 +1,379 @@
-+package dev.lelonio.square.ui.player
-+
-+import androidx.compose.foundation.Canvas
-+import androidx.compose.foundation.layout.fillMaxSize
-+import androidx.compose.material3.MaterialTheme
-+import androidx.compose.runtime.Composable
-+import androidx.compose.runtime.DisposableEffect
-+import androidx.compose.runtime.State
-+import androidx.compose.runtime.remember
-+import androidx.compose.ui.Modifier
-+import androidx.compose.ui.geometry.Offset
-+import androidx.compose.ui.geometry.Rect
-+import androidx.compose.ui.graphics.Brush
-+import androidx.compose.ui.graphics.Color
-+import androidx.compose.ui.graphics.Path
-+import androidx.compose.ui.graphics.drawscope.DrawScope
-+import androidx.compose.ui.graphics.drawscope.withTransform
-+import androidx.compose.ui.graphics.lerp
-+import androidx.compose.ui.platform.LocalContext
-+import androidx.compose.ui.text.TextLayoutResult
-+import androidx.compose.ui.text.TextMeasurer
-+import androidx.compose.ui.text.TextStyle
-+import androidx.compose.ui.text.drawText
-+import androidx.compose.ui.text.font.FontWeight
-+import androidx.compose.ui.text.rememberTextMeasurer
-+import androidx.compose.ui.unit.dp
-+import androidx.compose.ui.unit.sp
-+import dev.lelonio.square.data.LyricLine
-+import dev.lelonio.square.data.Lyrics
-+import kotlin.math.sin
-+import kotlin.math.sqrt
-+
-+/** The glow and heart of the word being sung. */
-+private val StarOrange = Color(0xFFFF5A1F)
-+
-+/** The warm white of the word being sung. */
-+private val StarPeach = Color(0xFFFFD9C4)
-+
-+/** How long the lines to a new star take to reach it. */
-+private const val LINK_MS = 260f
-+
-+/** How long the old phrase takes to go out as the next one starts. */
-+private const val HAND_OVER_MS = 450f
-+
-+/** How long a phrase stays up after its last word before it fades out on its own. */
-+private const val LINGER_MS = 1600L
-+
-+/** How long that fade takes. */
-+private const val LINGER_FADE_MS = 500f
-+
-+/** How long a word takes to shrink to a label once the next word is sung. */
-+private const val SHRINK_MS = 350f
-+
-+/** A label's size once shrunk, against the size of the word being sung. */
-+private const val LABEL_SCALE = 0.37f
-+
-+/** A four-pointed sparkle of radius 1, centred on the origin. */
-+private val SparkPath = Path().apply {
-+    moveTo(0f, -1f)
-+    lineTo(0.2f, -0.2f)
-+    lineTo(1f, 0f)
-+    lineTo(0.2f, 0.2f)
-+    lineTo(0f, 1f)
-+    lineTo(-0.2f, 0.2f)
-+    lineTo(-1f, 0f)
-+    lineTo(-0.2f, -0.2f)
-+    close()
-+}
-+
-+/**
-+ * The lyrics as a constellation.
-+ *
-+ * A line is a phrase, and a phrase is a small piece of sky: each word, as it is
-+ * sung, lights a star somewhere on the screen and is joined to the one before
-+ * by a thin line that draws itself across. The word being sung is large and
-+ * warm, with an orange star and a glow; the moment the next word comes it
-+ * shrinks to a small label beside its star and stays there, and the phrase
-+ * builds up until the next line starts, when it fades and a new sky begins.
-+ *
-+ * Where the stars sit is chosen once for each line from the line itself, so a
-+ * song is laid out the same way every time it is played.
-+ *
-+ * It is made to be read wide, so showing it turns the phone onto its side,
-+ * and leaving it hands the choice back to the phone. Lyrics that are not
-+ * synced have no "now" for a sky to follow, so they are shown plainly, as in
-+ * the classic view, and the phone is left as it is.
-+ */
-+@Composable
-+fun ConstellationLyricsView(
-+    lyrics: Lyrics,
-+    positionMs: State<Long>,
-+    modifier: Modifier = Modifier,
-+    showTranslation: Boolean = false,
-+    onSeek: (Long) -> Unit,
-+) {
-+    if (!lyrics.synced) {
-+        ClassicLyricsView(
-+            lyrics = lyrics,
-+            positionMs = positionMs,
-+            modifier = modifier,
-+            showTranslation = showTranslation,
-+            onSeek = onSeek,
-+        )
-+    } else {
-+        ConstellationSky(lyrics, positionMs, modifier)
-+    }
-+}
-+
-+@Composable
-+private fun ConstellationSky(
-+    lyrics: Lyrics,
-+    positionMs: State<Long>,
-+    modifier: Modifier,
-+) {
-+    // Onto its side while the sky is up, and back to the phone's own choice
-+    // when it is not.
-+    val context = LocalContext.current
-+    DisposableEffect(Unit) {
-+        lockVideoOrientation(context, true)
-+        onDispose { lockVideoOrientation(context, null) }
-+    }
-+
-+    val ink = GlassInk
-+    val measurer = rememberTextMeasurer()
-+    val clock = rememberFrameClock(positionMs, true)
-+    val bigStyle = MaterialTheme.typography.headlineSmall.copy(
-+        fontSize = 30.sp,
-+        fontWeight = FontWeight.Bold,
-+    )
-+    val lines = lyrics.lines
-+    val starts = remember(lyrics) { LongArray(lines.size) { lines[it].startTimeMs ?: 0L } }
-+    // Built the first time a line is needed, then kept.
-+    val phrases = remember(lyrics) { arrayOfNulls<Phrase>(lines.size) }
-+
-+    Canvas(modifier.fillMaxSize()) {
-+        val pos = clock.value
-+
-+        // The phrase being sung: the latest line that has started and has
-+        // words. A gap in the song leaves the last phrase up until it fades.
-+        var current = -1
-+        for (i in lines.indices.reversed()) {
-+            if (starts[i] <= pos && lines[i].text.isNotBlank()) {
-+                current = i
-+                break
-+            }
-+        }
-+        if (current < 0) return@Canvas
-+        var before = -1
-+        for (i in current - 1 downTo 0) {
-+            if (lines[i].text.isNotBlank()) {
-+                before = i
-+                break
-+            }
-+        }
-+
-+        // The round buttons down the right of the screen keep to their own
-+        // strip, so the sky leaves it free.
-+        val area = Rect(
-+            left = 28.dp.toPx(),
-+            top = 20.dp.toPx(),
-+            right = size.width - 64.dp.toPx(),
-+            bottom = size.height - 20.dp.toPx(),
-+        )
-+
-+        val sinceStart = pos - starts[current]
-+        val handOver = (sinceStart / HAND_OVER_MS).coerceIn(0f, 1f)
-+
-+        if (before >= 0 && handOver < 1f) {
-+            drawPhrase(
-+                phraseFor(phrases, lines, before), pos, 1f - handOver,
-+                area, ink, measurer, bigStyle,
-+            )
-+        }
-+        drawPhrase(
-+            phraseFor(phrases, lines, current), pos, 1f,
-+            area, ink, measurer, bigStyle,
-+        )
-+    }
-+}
-+
-+/** One line of the song as a piece of sky: when its words come, and where its stars are. */
-+private class Phrase(
-+    val line: LyricLine,
-+    val reveal: Reveal,
-+    /** Where each star sits, as a fraction of the sky, across and down. */
-+    val xs: FloatArray,
-+    val ys: FloatArray,
-+    /** For a star, an earlier one it is also joined to, or -1. */
-+    val extra: IntArray,
-+) {
-+    /** Each word, measured at the size of the word being sung, when it is first needed. */
-+    val labels = arrayOfNulls<TextLayoutResult>(xs.size)
-+}
-+
-+private fun phraseFor(cache: Array<Phrase?>, lines: List<LyricLine>, index: Int): Phrase {
-+    cache[index]?.let { return it }
-+    val line = lines[index]
-+    val reveal = revealOf(line, lines.getOrNull(index + 1)?.startTimeMs)
-+    val count = reveal.starts.size
-+    val random = java.util.Random(index * 7919L + line.text.hashCode())
-+
-+    val xs = FloatArray(count)
-+    val ys = FloatArray(count)
-+    var x = 0.12f + random.nextFloat() * 0.25f
-+    var y = 0.25f + random.nextFloat() * 0.5f
-+    var direction = 1f
-+    for (i in 0 until count) {
-+        var nx = x
-+        var ny = y
-+        var tries = 0
-+        do {
-+            if (i > 0) {
-+                nx = x + direction * (0.10f + random.nextFloat() * 0.14f)
-+                ny = y + (random.nextFloat() - 0.5f) * 0.6f
-+                // Turns back at the edge, so a long line zigzags across the sky.
-+                if (nx > 0.92f || nx < 0.08f) {
-+                    direction = -direction
-+                    nx = x + direction * (0.10f + random.nextFloat() * 0.14f)
-+                }
-+            }
-+            nx = nx.coerceIn(0.08f, 0.92f)
-+            ny = ny.coerceIn(0.14f, 0.86f)
-+            tries++
-+        } while (tries < 12 && (0 until i).any { j ->
-+                // The sky is wider than it is tall, so a step across counts for less.
-+                val dx = (xs[j] - nx) * 1.8f
-+                val dy = ys[j] - ny
-+                sqrt(dx * dx + dy * dy) < 0.16f
-+            })
-+        xs[i] = nx
-+        ys[i] = ny
-+        x = nx
-+        y = ny
-+    }
-+    // Now and then a star is joined back to an earlier one too, so the lines
-+    // make a web and not just a path.
-+    val extra = IntArray(count) { i ->
-+        if (i >= 3 && random.nextInt(100) < 35) random.nextInt(i - 1) else -1
-+    }
-+    return Phrase(line, reveal, xs, ys, extra).also { cache[index] = it }
-+}
-+
-+private fun mix(from: Float, to: Float, fraction: Float): Float = from + (to - from) * fraction
-+
-+/** Overshoots a little on the way to 1, like a spring. */
-+private fun backOut(fraction: Float): Float {
-+    val c = fraction.coerceIn(0f, 1f) - 1f
-+    return 1f + 2.70158f * c * c * c + 1.70158f * c * c
-+}
-+
-+private fun smooth(fraction: Float): Float {
-+    val x = fraction.coerceIn(0f, 1f)
-+    return x * x * (3f - 2f * x)
-+}
-+
-+private fun clampTo(value: Float, low: Float, high: Float): Float =
-+    if (low > high) (low + high) / 2f else value.coerceIn(low, high)
-+
-+private fun DrawScope.drawPhrase(
-+    phrase: Phrase,
-+    pos: Long,
-+    fade: Float,
-+    area: Rect,
-+    ink: Color,
-+    measurer: TextMeasurer,
-+    bigStyle: TextStyle,
-+) {
-+    val reveal = phrase.reveal
-+    val count = reveal.starts.size
-+    if (count == 0) return
-+
-+    // The word being sung: the last one that has started.
-+    var current = -1
-+    for (i in 0 until count) if (reveal.starts[i] <= pos) current = i
-+    if (current < 0) return
-+
-+    // A phrase left standing after its last word goes out on its own.
-+    val lingerEnd = reveal.ends[count - 1] + LINGER_MS
-+    val alpha = fade * (1f - (pos - lingerEnd) / LINGER_FADE_MS).coerceIn(0f, 1f)
-+    if (alpha <= 0f) return
-+
-+    val dp = 1.dp.toPx()
-+    val width = area.width
-+    val height = area.height
-+    fun starX(i: Int) = area.left + phrase.xs[i] * width
-+    fun starY(i: Int) = area.top + phrase.ys[i] * height
-+
-+    // The lines first, so the stars and words sit over them.
-+    val lineColor = ink.copy(alpha = 0.32f * alpha)
-+    for (i in 1..current) {
-+        val reach = ((pos - reveal.starts[i]) / LINK_MS).coerceIn(0f, 1f)
-+        val from = Offset(starX(i - 1), starY(i - 1))
-+        val to = Offset(starX(i), starY(i))
-+        drawLine(
-+            lineColor, from,
-+            Offset(mix(from.x, to.x, reach), mix(from.y, to.y, reach)),
-+            strokeWidth = dp,
-+        )
-+        val back = phrase.extra[i]
-+        if (back >= 0) {
-+            val other = Offset(starX(back), starY(back))
-+            drawLine(
-+                lineColor.copy(alpha = 0.18f * alpha), to,
-+                Offset(mix(to.x, other.x, reach), mix(to.y, other.y, reach)),
-+                strokeWidth = dp,
-+            )
-+        }
-+    }
-+
-+    for (i in 0..current) {
-+        val sung = pos - reveal.starts[i]
-+        val centre = Offset(starX(i), starY(i))
-+        val isCurrent = i == current
-+
-+        // The star: it pops in, and the one being sung breathes.
-+        val appear = backOut(sung / 220f)
-+        val breathe = if (isCurrent) 1f + 0.1f * sin(pos / 170f) else 1f
-+        val radius = (if (isCurrent) 7.dp.toPx() else 4.dp.toPx()) * appear * breathe
-+        if (isCurrent) {
-+            val glow = 20.dp.toPx() * appear
-+            drawCircle(
-+                brush = Brush.radialGradient(
-+                    listOf(StarOrange.copy(alpha = 0.55f * alpha), Color.Transparent),
-+                    center = centre,
-+                    radius = glow,
-+                ),
-+                radius = glow,
-+                center = centre,
-+            )
-+        }
-+        val starColor = if (isCurrent) StarOrange else ink.copy(alpha = 0.8f)
-+        withTransform({
-+            translate(centre.x, centre.y)
-+            scale(radius, radius, Offset.Zero)
-+        }) {
-+            drawPath(SparkPath, starColor.copy(alpha = starColor.alpha * alpha))
-+        }
-+
-+        // The word: large and warm while it is sung, a small label after.
-+        val range = phrase.reveal.ranges[i]
-+        val line = phrase.line
-+        if (range.last >= line.text.length) continue
-+        val layout = phrase.labels[i] ?: measurer.measure(
-+            line.text.substring(range.first, range.last + 1),
-+            bigStyle,
-+        ).also { phrase.labels[i] = it }
-+        val w = layout.size.width.toFloat()
-+        val h = layout.size.height.toFloat()
-+
-+        // How far it has shrunk: not at all while it is the word being sung.
-+        val shrunk = if (isCurrent) 0f else smooth((pos - reveal.starts[i + 1]) / SHRINK_MS)
-+        val scale = if (isCurrent) 0.55f + 0.45f * backOut(sung / 200f) else mix(1f, LABEL_SCALE, shrunk)
-+
-+        // Beside its star, on whichever side has the room; as a label, below
-+        // and to the right of it.
-+        val bigSide = if (phrase.xs[i] > 0.6f) -1f else 1f
-+        val bigCx = centre.x + bigSide * (w / 2f + 16.dp.toPx())
-+        val bigCy = centre.y
-+        val smallCx = centre.x + w * LABEL_SCALE / 2f + 7.dp.toPx()
-+        val smallCy = centre.y + 9.dp.toPx()
-+        var cx = mix(bigCx, smallCx, shrunk)
-+        var cy = mix(bigCy, smallCy, shrunk)
-+        cx = clampTo(cx, area.left + w * scale / 2f, area.right - w * scale / 2f)
-+        cy = clampTo(cy, area.top + h * scale / 2f, area.bottom - h * scale / 2f)
-+
-+        val big = lerp(ink, StarPeach, 0.55f)
-+        val small = ink.copy(alpha = 0.55f)
-+        val wordColor = lerp(big, small, shrunk)
-+        val appearAlpha = (sung / 140f).coerceIn(0f, 1f)
-+        val labelCentre = Offset(cx, cy)
-+        withTransform({ scale(scale, scale, labelCentre) }) {
-+            drawText(
-+                layout,
-+                color = wordColor.copy(alpha = wordColor.alpha * alpha * appearAlpha),
-+                topLeft = Offset(cx - w / 2f, cy - h / 2f),
-+            )
-+        }
-+    }
-+}
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt	2026-11-23 13:19:09.767554276 +0000
-@@ -232,8 +232,8 @@
-                     }
-                 }
-                 Heading(stringResource(R.string.lyrics_style_title), top = 10.dp)
--                // Two side by side, on one line: a choice of two does not need
--                // two rows, and the panel has to fit the lyrics' own space.
-+                // Side by side, on one line: a choice of three short names does not need
-+                // three rows, and the panel has to fit the lyrics' own space.
-                 Row(
-                     Modifier.padding(horizontal = 18.dp),
-                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-@@ -245,6 +245,8 @@
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
+index 4ebecff..beb3d8e 100644
+--- a/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
++++ b/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
+@@ -245,7 +245,8 @@ fun LyricsOptionsPanel(
                                  when (option) {
                                      LyricsStyle.ANIMATED -> R.string.lyrics_style_animated
                                      LyricsStyle.CLASSIC -> R.string.lyrics_style_classic
+-                                                                        LyricsStyle.CONSTELLATION -> R.string.lyrics_style_constellation
 +                                    LyricsStyle.MESSAGES -> R.string.lyrics_style_messages
 +                                    LyricsStyle.CONSTELLATION -> R.string.lyrics_style_constellation
                                  },
                              ),
                              style = MaterialTheme.typography.bodyMedium,
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt	1970-01-01 00:00:00.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt	2026-11-23 13:19:22.726961954 +0000
-@@ -0,0 +1,686 @@
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+new file mode 100644
+index 0000000..ba796ff
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/MessagesLyricsView.kt
+@@ -0,0 +1,662 @@
 +package dev.lelonio.square.ui.player
 +
 +import androidx.compose.animation.core.Animatable
@@ -488,10 +71,7 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +import androidx.compose.runtime.State
 +import androidx.compose.runtime.derivedStateOf
 +import androidx.compose.runtime.getValue
-+import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
-+import androidx.compose.runtime.snapshotFlow
-+import androidx.compose.runtime.withFrameNanos
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.clip
@@ -520,8 +100,6 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +import androidx.compose.ui.unit.sp
 +import dev.lelonio.square.data.LyricLine
 +import dev.lelonio.square.data.Lyrics
-+import kotlin.math.abs
-+import kotlinx.coroutines.flow.collectLatest
 +
 +/** The blue of a sent message. */
 +private val SentBlue = Color(0xFF0A84FF)
@@ -569,7 +147,21 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +    val activeLine by remember(lyrics) {
 +        derivedStateOf {
 +            if (!lyrics.synced) -1
-+            else lyrics.lines.indexOfLast { (it.startTimeMs ?: 0L) <= positionMs.value }
++            else {
++                // Lyric timestamps are ordered. Find the last reached line in
++                // logarithmic time instead of scanning the whole song per tick.
++                var low = 0
++                var high = lyrics.lines.size
++                while (low < high) {
++                    val mid = (low + high) ushr 1
++                    if ((lyrics.lines[mid].startTimeMs ?: 0L) <= positionMs.value) {
++                        low = mid + 1
++                    } else {
++                        high = mid
++                    }
++                }
++                low - 1
++            }
 +        }
 +    }
 +
@@ -696,41 +288,6 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +    return ChatLayout(atEnd, next)
 +}
 +
-+/** When each word of a line is sung and stops being sung, and where it sits in the line's text. */
-+internal class Reveal(val starts: LongArray, val ends: LongArray, val ranges: List<IntRange>)
-+
-+/**
-+ * The words of [line] with the moment each is sung: the source's own timing
-+ * where it has it, otherwise the line's time shared out by word length, over
-+ * the first four fifths of the time before the next line.
-+ */
-+internal fun revealOf(line: LyricLine, endMs: Long?): Reveal {
-+    val found = wordRanges(line)
-+    if (line.words.isNotEmpty() && found.none { it == null }) {
-+        return Reveal(
-+            LongArray(line.words.size) { line.words[it].startMs },
-+            LongArray(line.words.size) { line.words[it].endMs },
-+            found.map { it!! },
-+        )
-+    }
-+    val spans = Regex("\\S+").findAll(line.text).map { it.range }.toList()
-+    val start = line.startTimeMs ?: 0L
-+    val room = ((endMs ?: (start + 4000L)) - start).coerceIn(600L, 6000L)
-+    val singing = room * 4 / 5
-+    val total = spans.sumOf { it.last - it.first + 2 }.coerceAtLeast(1)
-+    var used = 0
-+    val starts = LongArray(spans.size) { i ->
-+        val at = start + singing * used / total
-+        used += spans[i].last - spans[i].first + 2
-+        at
-+    }
-+    // A word lasts until the next one starts; the last one to the end of the song's share.
-+    val ends = LongArray(spans.size) { i ->
-+        if (i < spans.lastIndex) starts[i + 1] else start + singing
-+    }
-+    return Reveal(starts, ends, spans)
-+}
-+
 +/** How long word [i] stays enlarged: as long as it is sung, within reason. */
 +private fun holdMs(reveal: Reveal, i: Int): Long =
 +    (reveal.ends[i] - reveal.starts[i]).coerceIn(250L, 900L)
@@ -853,38 +410,40 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +}
 +
 +/**
-+ * A clock for animating words that runs on the screen's own frames.
-+ *
-+ * The song's position is only reported every so often, and an animation
-+ * driven straight from it moves in steps of that size however fast the screen
-+ * refreshes. This one carries on from the last report frame by frame, so the
-+ * words move smoothly, and follows the reports so it never drifts: a report
-+ * well away from where it expected (a seek) is taken as it is. It runs on for
-+ * only a third of a second after a report, so a paused song, which reports
-+ * nothing, stops asking the screen for frames.
++ * A smooth playback clock. Position reports correct the anchor, while a single
++ * frame loop advances between reports. This avoids restarting a short animation
++ * window for every player position update, which can make word motion stutter.
 + */
 +@Composable
 +internal fun rememberFrameClock(positionMs: State<Long>, running: Boolean): State<Long> {
-+    // Starts empty and is filled from the effect below: reading the position
-+    // here, while composing, would recompose the caller on every report.
-+    val smooth = remember { mutableStateOf(0L) }
-+    LaunchedEffect(running) {
-+        if (!running) return@LaunchedEffect
++    val smooth = remember { mutableLongStateOf(positionMs.value) }
++    LaunchedEffect(running, positionMs) {
++        if (!running) {
++            smooth.longValue = positionMs.value
++            return@LaunchedEffect
++        }
 +        var anchor = positionMs.value
 +        var anchorAt = System.nanoTime()
-+        smooth.value = anchor
-+        snapshotFlow { positionMs.value }.collectLatest { reported ->
-+            val now = System.nanoTime()
-+            val expected = anchor + (now - anchorAt) / 1_000_000L
-+            anchor = reported
-+            anchorAt = now
-+            if (abs(reported - expected) > 600L) smooth.value = reported
-+            val until = now + 350_000_000L
-+            while (true) {
-+                val frame = withFrameNanos { System.nanoTime() }
-+                if (frame > until) break
-+                val ahead = ((frame - anchorAt) / 1_000_000L).coerceAtMost(300L)
-+                smooth.value = maxOf(smooth.value, anchor + ahead)
++        smooth.longValue = anchor
++        coroutineScope {
++            val reporter = launch {
++                snapshotFlow { positionMs.value }.collect { reported ->
++                    val now = System.nanoTime()
++                    val expected = anchor + (now - anchorAt) / 1_000_000L
++                    if (abs(reported - expected) > 600L) smooth.longValue = reported
++                    anchor = reported
++                    anchorAt = now
++                }
++            }
++            try {
++                while (isActive) {
++                    withFrameNanos {
++                        val now = System.nanoTime()
++                        smooth.longValue = anchor + (now - anchorAt) / 1_000_000L
++                    }
++                }
++            } finally {
++                reporter.cancel()
 +            }
 +        }
 +    }
@@ -1134,9 +693,11 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Mess
 +        }
 +    }
 +}
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt	1970-01-01 00:00:00.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt	2026-11-23 13:19:09.768135756 +0000
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt b/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt
+new file mode 100644
+index 0000000..5dbbab5
+--- /dev/null
++++ b/app/src/main/java/dev/lelonio/square/ui/player/PlaceHints.kt
 @@ -0,0 +1,172 @@
 +package dev.lelonio.square.ui.player
 +
@@ -1310,25 +871,14 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Plac
 +    }
 +    return null
 +}
-diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
---- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt	2026-11-23 13:19:09.768705859 +0000
-@@ -3017,6 +3017,30 @@
-                 color = GlassInkDim,
-             )
+diff --git a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
+index d976544..4396845 100644
+--- a/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
++++ b/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
+@@ -3029,6 +3029,18 @@ private fun LyricsStage(
+                 )
+             }
  
-+            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CONSTELLATION -> CompositionLocalProvider(
-+                LocalLayoutDirection provides songDirection,
-+            ) {
-+                ConstellationLyricsView(
-+                    lyrics = shown ?: lyrics,
-+                    positionMs = heardMs,
-+                    showTranslation = translated || romanized,
-+                    onSeek = seekHeard,
-+                    modifier = Modifier.fillMaxSize(),
-+                )
-+            }
-+
 +            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.MESSAGES -> CompositionLocalProvider(
 +                LocalLayoutDirection provides songDirection,
 +            ) {
@@ -1344,147 +894,147 @@ diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/Play
              style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CLASSIC -> CompositionLocalProvider(
                  LocalLayoutDirection provides songDirection,
              ) {
-diff -ruN orig/Square-master/app/src/main/res/values/strings.xml Square-master/app/src/main/res/values/strings.xml
---- Square-orig/app/src/main/res/values/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values/strings.xml	2026-11-23 13:19:09.769295153 +0000
-@@ -657,6 +657,8 @@
-     <string name="lyrics_style_title">Style</string>
-     <string name="lyrics_style_animated">Animated</string>
-     <string name="lyrics_style_classic">Classic</string>
-+    <string name="lyrics_style_messages">Messages</string>
-+    <string name="lyrics_style_constellation">Stars</string>
-     <string name="lyrics_word">Word by word</string>
-     <string name="lyrics_line">By line</string>
-     <string name="lyrics_unsynced">Not synced</string>
-diff -ruN orig/Square-master/app/src/main/res/values-de/strings.xml Square-master/app/src/main/res/values-de/strings.xml
---- Square-orig/app/src/main/res/values-de/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-de/strings.xml	2026-11-23 13:19:09.769567424 +0000
-@@ -591,6 +591,8 @@
+diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
+index e5293db..f6a59e8 100644
+--- a/app/src/main/res/values-de/strings.xml
++++ b/app/src/main/res/values-de/strings.xml
+@@ -591,6 +591,7 @@
      <string name="lyrics_style_title">Stil</string>
      <string name="lyrics_style_animated">Animiert</string>
      <string name="lyrics_style_classic">Klassisch</string>
 +    <string name="lyrics_style_messages">Nachrichten</string>
-+    <string name="lyrics_style_constellation">Sterne</string>
+     <string name="lyrics_style_constellation">Sterne</string>
      <string name="lyrics_word">Wort für Wort</string>
      <string name="lyrics_line">Zeilenweise</string>
-     <string name="lyrics_unsynced">Nicht synchron</string>
-diff -ruN orig/Square-master/app/src/main/res/values-es/strings.xml Square-master/app/src/main/res/values-es/strings.xml
---- Square-orig/app/src/main/res/values-es/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-es/strings.xml	2026-11-23 13:19:09.769800555 +0000
-@@ -597,6 +597,8 @@
+diff --git a/app/src/main/res/values-es/strings.xml b/app/src/main/res/values-es/strings.xml
+index 9b739f9..9d7b194 100644
+--- a/app/src/main/res/values-es/strings.xml
++++ b/app/src/main/res/values-es/strings.xml
+@@ -597,6 +597,7 @@
      <string name="lyrics_style_title">Estilo</string>
      <string name="lyrics_style_animated">Animado</string>
      <string name="lyrics_style_classic">Clásico</string>
 +    <string name="lyrics_style_messages">Mensajes</string>
-+    <string name="lyrics_style_constellation">Estrellas</string>
+     <string name="lyrics_style_constellation">Estrellas</string>
      <string name="lyrics_word">Palabra por palabra</string>
      <string name="lyrics_line">Por línea</string>
-     <string name="lyrics_unsynced">Sin sincronizar</string>
-diff -ruN orig/Square-master/app/src/main/res/values-fr/strings.xml Square-master/app/src/main/res/values-fr/strings.xml
---- Square-orig/app/src/main/res/values-fr/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-fr/strings.xml	2026-11-23 13:19:09.769999279 +0000
-@@ -591,6 +591,8 @@
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index bbb930a..a1b80cb 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -591,6 +591,7 @@
      <string name="lyrics_style_title">Style</string>
      <string name="lyrics_style_animated">Animé</string>
      <string name="lyrics_style_classic">Classique</string>
 +    <string name="lyrics_style_messages">Messages</string>
-+    <string name="lyrics_style_constellation">Étoiles</string>
+     <string name="lyrics_style_constellation">Étoiles</string>
      <string name="lyrics_word">Mot à mot</string>
      <string name="lyrics_line">Par ligne</string>
-     <string name="lyrics_unsynced">Non synchronisées</string>
-diff -ruN orig/Square-master/app/src/main/res/values-hi/strings.xml Square-master/app/src/main/res/values-hi/strings.xml
---- Square-orig/app/src/main/res/values-hi/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-hi/strings.xml	2026-11-23 13:19:09.770291021 +0000
-@@ -606,6 +606,8 @@
+diff --git a/app/src/main/res/values-hi/strings.xml b/app/src/main/res/values-hi/strings.xml
+index 5803be8..d0044ef 100644
+--- a/app/src/main/res/values-hi/strings.xml
++++ b/app/src/main/res/values-hi/strings.xml
+@@ -606,6 +606,7 @@
      <string name="lyrics_style_title">शैली</string>
      <string name="lyrics_style_animated">एनिमेटेड</string>
      <string name="lyrics_style_classic">क्लासिक</string>
 +    <string name="lyrics_style_messages">संदेश</string>
-+    <string name="lyrics_style_constellation">तारे</string>
+     <string name="lyrics_style_constellation">तारे</string>
      <string name="lyrics_word">शब्द-दर-शब्द</string>
      <string name="lyrics_line">पंक्ति-दर-पंक्ति</string>
-     <string name="lyrics_unsynced">सिंक नहीं</string>
-diff -ruN orig/Square-master/app/src/main/res/values-it/strings.xml Square-master/app/src/main/res/values-it/strings.xml
---- Square-orig/app/src/main/res/values-it/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-it/strings.xml	2026-11-23 13:19:09.770543153 +0000
-@@ -630,6 +630,8 @@
+diff --git a/app/src/main/res/values-it/strings.xml b/app/src/main/res/values-it/strings.xml
+index f9492b5..e32dedb 100644
+--- a/app/src/main/res/values-it/strings.xml
++++ b/app/src/main/res/values-it/strings.xml
+@@ -630,6 +630,7 @@
      <string name="lyrics_style_title">Stile</string>
      <string name="lyrics_style_animated">Animato</string>
      <string name="lyrics_style_classic">Classico</string>
 +    <string name="lyrics_style_messages">Messaggi</string>
-+    <string name="lyrics_style_constellation">Stelle</string>
+     <string name="lyrics_style_constellation">Stelle</string>
      <string name="lyrics_word">Parola per parola</string>
      <string name="lyrics_line">Per riga</string>
-     <string name="lyrics_unsynced">Non sincronizzato</string>
-diff -ruN orig/Square-master/app/src/main/res/values-ja/strings.xml Square-master/app/src/main/res/values-ja/strings.xml
---- Square-orig/app/src/main/res/values-ja/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-ja/strings.xml	2026-11-23 13:19:09.770801073 +0000
-@@ -647,6 +647,8 @@
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 29e152d..6149b92 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -647,6 +647,7 @@
      <string name="lyrics_style_title">表示スタイル</string>
      <string name="lyrics_style_animated">アニメーション</string>
      <string name="lyrics_style_classic">クラシック</string>
 +    <string name="lyrics_style_messages">メッセージ</string>
-+    <string name="lyrics_style_constellation">星空</string>
+     <string name="lyrics_style_constellation">星空</string>
      <string name="lyrics_word">単語単位で同期</string>
      <string name="lyrics_line">行単位で同期</string>
-     <string name="lyrics_unsynced">未同期</string>
-diff -ruN orig/Square-master/app/src/main/res/values-ko/strings.xml Square-master/app/src/main/res/values-ko/strings.xml
---- Square-orig/app/src/main/res/values-ko/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-ko/strings.xml	2026-11-23 13:19:09.771058489 +0000
-@@ -615,6 +615,8 @@
+diff --git a/app/src/main/res/values-ko/strings.xml b/app/src/main/res/values-ko/strings.xml
+index 816d6f5..27880ba 100644
+--- a/app/src/main/res/values-ko/strings.xml
++++ b/app/src/main/res/values-ko/strings.xml
+@@ -615,6 +615,7 @@
      <string name="lyrics_style_title">스타일</string>
      <string name="lyrics_style_animated">애니메이션</string>
      <string name="lyrics_style_classic">클래식</string>
 +    <string name="lyrics_style_messages">메시지</string>
-+    <string name="lyrics_style_constellation">별</string>
+     <string name="lyrics_style_constellation">별</string>
      <string name="lyrics_word">단어별</string>
      <string name="lyrics_line">줄별</string>
-     <string name="lyrics_unsynced">동기화되지 않음</string>
-diff -ruN orig/Square-master/app/src/main/res/values-pt/strings.xml Square-master/app/src/main/res/values-pt/strings.xml
---- Square-orig/app/src/main/res/values-pt/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-pt/strings.xml	2026-11-23 13:19:09.771281373 +0000
-@@ -591,6 +591,8 @@
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index 5541976..658628c 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -591,6 +591,7 @@
      <string name="lyrics_style_title">Estilo</string>
      <string name="lyrics_style_animated">Animado</string>
      <string name="lyrics_style_classic">Clássico</string>
 +    <string name="lyrics_style_messages">Mensagens</string>
-+    <string name="lyrics_style_constellation">Estrelas</string>
+     <string name="lyrics_style_constellation">Estrelas</string>
      <string name="lyrics_word">Palavra por palavra</string>
      <string name="lyrics_line">Por linha</string>
-     <string name="lyrics_unsynced">Não sincronizada</string>
-diff -ruN orig/Square-master/app/src/main/res/values-ru/strings.xml Square-master/app/src/main/res/values-ru/strings.xml
---- Square-orig/app/src/main/res/values-ru/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-ru/strings.xml	2026-11-23 13:19:09.771492848 +0000
-@@ -620,6 +620,8 @@
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 0df7cd4..686d54a 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -620,6 +620,7 @@
      <string name="lyrics_style_title">Стиль</string>
      <string name="lyrics_style_animated">Анимированный</string>
      <string name="lyrics_style_classic">Классический</string>
 +    <string name="lyrics_style_messages">Сообщения</string>
-+    <string name="lyrics_style_constellation">Звёзды</string>
+     <string name="lyrics_style_constellation">Звёзды</string>
      <string name="lyrics_word">По словам</string>
      <string name="lyrics_line">По строкам</string>
-     <string name="lyrics_unsynced">Без синхронизации</string>
-diff -ruN orig/Square-master/app/src/main/res/values-tr/strings.xml Square-master/app/src/main/res/values-tr/strings.xml
---- Square-orig/app/src/main/res/values-tr/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-tr/strings.xml	2026-11-23 13:19:09.771693748 +0000
-@@ -604,6 +604,8 @@
+diff --git a/app/src/main/res/values-tr/strings.xml b/app/src/main/res/values-tr/strings.xml
+index 628f237..ac80748 100644
+--- a/app/src/main/res/values-tr/strings.xml
++++ b/app/src/main/res/values-tr/strings.xml
+@@ -604,6 +604,7 @@
      <string name="lyrics_style_title">Stil</string>
      <string name="lyrics_style_animated">Animasyonlu</string>
      <string name="lyrics_style_classic">Klasik</string>
 +    <string name="lyrics_style_messages">Mesajlar</string>
-+    <string name="lyrics_style_constellation">Yıldızlar</string>
+     <string name="lyrics_style_constellation">Yıldızlar</string>
      <string name="lyrics_word">Kelime kelime</string>
      <string name="lyrics_line">Satır satır</string>
-     <string name="lyrics_unsynced">Senkronize değil</string>
-diff -ruN orig/Square-master/app/src/main/res/values-vi/strings.xml Square-master/app/src/main/res/values-vi/strings.xml
---- Square-orig/app/src/main/res/values-vi/strings.xml	2026-11-16 11:01:21.000000000 +0000
-+++ Square-master/app/src/main/res/values-vi/strings.xml	2026-11-23 13:19:09.771845026 +0000
-@@ -650,6 +650,8 @@
+diff --git a/app/src/main/res/values-vi/strings.xml b/app/src/main/res/values-vi/strings.xml
+index 2599b00..46a77ce 100644
+--- a/app/src/main/res/values-vi/strings.xml
++++ b/app/src/main/res/values-vi/strings.xml
+@@ -650,6 +650,7 @@
      <string name="lyrics_style_title">Kiểu</string>
      <string name="lyrics_style_animated">Động</string>
      <string name="lyrics_style_classic">Cổ điển</string>
 +    <string name="lyrics_style_messages">Tin nhắn</string>
-+    <string name="lyrics_style_constellation">Sao</string>
+     <string name="lyrics_style_constellation">Sao</string>
      <string name="lyrics_word">Theo từng từ</string>
      <string name="lyrics_line">Theo từng dòng</string>
-     <string name="lyrics_unsynced">Chưa đồng bộ</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 8e78622..19dd6ce 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -657,6 +657,7 @@
+     <string name="lyrics_style_title">Style</string>
+     <string name="lyrics_style_animated">Animated</string>
+     <string name="lyrics_style_classic">Classic</string>
++    <string name="lyrics_style_messages">Messages</string>
+     <string name="lyrics_style_constellation">Stars</string>
+     <string name="lyrics_word">Word by word</string>
+     <string name="lyrics_line">By line</string>
