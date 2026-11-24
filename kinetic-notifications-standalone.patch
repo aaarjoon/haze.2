@@ -1,0 +1,1078 @@
+diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt T2/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt
+--- Square-orig/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt	2026-11-24 06:51:09.235770002 +0530
++++ T2/app/src/main/java/dev/lelonio/square/data/PreferencesStore.kt	2026-11-24 12:50:50.713206676 +0530
+@@ -127,8 +127,12 @@
+         prefs.edit().putString(KEY_PREFERRED_LYRICS, value).apply()
+     }
+ 
+-    /** How the lyrics are drawn: animated word by word, or as plain lines. */
+-    enum class LyricsStyle { ANIMATED, CLASSIC }
++    /**
++     * How the lyrics are drawn: animated word by word, as plain lines, as one
++     * word at a time in a climbing column with a picture beside it, or as
++     * notifications that stack up the way a phone's do.
++     */
++    enum class LyricsStyle { ANIMATED, CLASSIC, KINETIC, NOTIFICATIONS }
+ 
+     private val _lyricsStyle = MutableStateFlow(
+         LyricsStyle.entries.firstOrNull { it.name == prefs.getString(KEY_LYRICS_STYLE, null) } ?: LyricsStyle.ANIMATED,
+diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/KineticLyricsView.kt T2/app/src/main/java/dev/lelonio/square/ui/player/KineticLyricsView.kt
+--- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/KineticLyricsView.kt	1970-01-01 05:30:00.000000000 +0530
++++ T2/app/src/main/java/dev/lelonio/square/ui/player/KineticLyricsView.kt	2026-11-24 12:50:50.682920332 +0530
+@@ -0,0 +1,372 @@
++package dev.lelonio.square.ui.player
++
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.runtime.withFrameNanos
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.withTransform
++import androidx.compose.ui.graphics.lerp
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.drawText
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.rememberTextMeasurer
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import dev.lelonio.square.data.LyricLine
++import dev.lelonio.square.data.Lyrics
++import kotlinx.coroutines.flow.collectLatest
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.sign
++import kotlin.math.sin
++
++/** The tint of the word that is coming up. */
++private val KineticAccent = Color(0xFFFF8A5B)
++
++/** The size of the word being sung. */
++private const val BIG_SP = 60f
++
++/** A word below this size, against the one being sung, is the one just sung or the one next. */
++private const val NEAR_SCALE = 0.42f
++
++/** Further out than that, a word is smaller still, on its way out of sight. */
++private const val FAR_SCALE = 0.30f
++
++/** The quickest and slowest the stack climbs to the next word. */
++private const val CLIMB_MIN_MS = 90L
++private const val CLIMB_MAX_MS = 230L
++
++/** How long after a word ends, with nothing following, the words go out. */
++private const val IDLE_AFTER_MS = 2500L
++
++/** How long that takes. */
++private const val IDLE_FADE_MS = 500f
++
++/** Words that get a small picture beside them. */
++private val KineticIcons: Map<String, String> = mapOf(
++    "heart" to "❤️", "hearts" to "❤️", "love" to "❤️",
++    "loved" to "❤️", "loving" to "❤️",
++    "car" to "🚗", "cars" to "🚗", "drive" to "🚗",
++    "driving" to "🚗", "speedin" to "🚗", "speeding" to "🚗",
++    "think" to "🧠", "thinking" to "🧠", "mind" to "🧠",
++    "fire" to "🔥", "flame" to "🔥", "flames" to "🔥",
++    "burn" to "🔥", "burning" to "🔥", "hot" to "🔥",
++    "star" to "⭐", "stars" to "⭐",
++    "sun" to "☀️", "sunshine" to "☀️",
++    "moon" to "🌙", "night" to "🌙",
++    "rain" to "🌧️", "storm" to "⛈️",
++    "cry" to "😢", "crying" to "😢", "tears" to "😢",
++    "dance" to "💃", "dancing" to "💃",
++    "money" to "💰", "cash" to "💰",
++    "time" to "⏰", "clock" to "⏰",
++    "world" to "🌍", "earth" to "🌍",
++    "phone" to "📞", "call" to "📞",
++    "eyes" to "👀", "eye" to "👀",
++    "kiss" to "💋", "kisses" to "💋",
++    "music" to "🎵", "song" to "🎵", "sing" to "🎵",
++    "home" to "🏠", "house" to "🏠",
++    "angel" to "😇", "devil" to "😈",
++    "smile" to "😊", "dream" to "💭", "dreams" to "💭",
++    "water" to "💧", "ocean" to "🌊", "sea" to "🌊",
++    "gold" to "🥇", "crown" to "👑", "king" to "👑", "queen" to "👑",
++    "pain" to "💔", "broken" to "💔",
++)
++
++private fun iconFor(word: String): String? =
++    KineticIcons[word.lowercase().filter { it.isLetter() }]
++
++/** When each word of a line is sung and stops being sung, and where it sits in the line's text. */
++private class Spans(val starts: LongArray, val ends: LongArray, val ranges: List<IntRange>)
++
++/**
++ * The words of [line] with the moment each is sung: the source's own timing
++ * where it has it, otherwise the line's time shared out by word length, over
++ * the first four fifths of the time before the next line.
++ */
++private fun spansOf(line: LyricLine, endMs: Long?): Spans {
++    if (line.words.isNotEmpty()) {
++        var cursor = 0
++        val found = ArrayList<IntRange>(line.words.size)
++        for (word in line.words) {
++            val at = line.text.indexOf(word.text, cursor)
++            if (at < 0) break
++            found.add(at until at + word.text.length)
++            cursor = at + word.text.length
++        }
++        if (found.size == line.words.size) {
++            return Spans(
++                LongArray(line.words.size) { line.words[it].startMs },
++                LongArray(line.words.size) { line.words[it].endMs },
++                found,
++            )
++        }
++    }
++    val spans = Regex("\\S+").findAll(line.text).map { it.range }.toList()
++    val start = line.startTimeMs ?: 0L
++    val room = ((endMs ?: (start + 4000L)) - start).coerceIn(600L, 6000L)
++    val singing = room * 4 / 5
++    val total = spans.sumOf { it.last - it.first + 2 }.coerceAtLeast(1)
++    var used = 0
++    val starts = LongArray(spans.size) { i ->
++        val at = start + singing * used / total
++        used += spans[i].last - spans[i].first + 2
++        at
++    }
++    val ends = LongArray(spans.size) { i ->
++        if (i < spans.lastIndex) starts[i + 1] else start + singing
++    }
++    return Spans(starts, ends, spans)
++}
++
++/**
++ * A clock that runs on the screen's own frames. The song's position is only
++ * reported every so often; this carries on from the last report frame by
++ * frame so the words move smoothly, follows the reports so it never drifts,
++ * and runs on for only a third of a second after one, so a paused song stops
++ * asking the screen for frames.
++ */
++@Composable
++private fun rememberKineticClock(positionMs: State<Long>): State<Long> {
++    val smooth = remember { mutableStateOf(0L) }
++    LaunchedEffect(Unit) {
++        var anchor = positionMs.value
++        var anchorAt = System.nanoTime()
++        smooth.value = anchor
++        snapshotFlow { positionMs.value }.collectLatest { reported ->
++            val now = System.nanoTime()
++            val expected = anchor + (now - anchorAt) / 1_000_000L
++            anchor = reported
++            anchorAt = now
++            if (abs(reported - expected) > 600L) smooth.value = reported
++            val until = now + 350_000_000L
++            while (true) {
++                val frame = withFrameNanos { System.nanoTime() }
++                if (frame > until) break
++                val ahead = ((frame - anchorAt) / 1_000_000L).coerceAtMost(300L)
++                smooth.value = maxOf(smooth.value, anchor + ahead)
++            }
++        }
++    }
++    return smooth
++}
++
++/** Every word of the song, in the order it is sung, with when it starts and when it is done. */
++private class SungWords(val starts: LongArray, val ends: LongArray, val texts: Array<String>)
++
++private fun sungWordsOf(lyrics: Lyrics): SungWords {
++    val starts = ArrayList<Long>()
++    val ends = ArrayList<Long>()
++    val texts = ArrayList<String>()
++    val lines = lyrics.lines
++    for (i in lines.indices) {
++        val line = lines[i]
++        if (line.text.isBlank()) continue
++        val reveal = spansOf(line, lines.getOrNull(i + 1)?.startTimeMs)
++        for (w in reveal.starts.indices) {
++            val range = reveal.ranges[w]
++            if (range.first < 0 || range.last >= line.text.length) continue
++            val text = line.text.substring(range.first, range.last + 1)
++            if (text.isBlank()) continue
++            // Never before the word that came first, so the order can be searched.
++            val start = maxOf(reveal.starts[w], starts.lastOrNull() ?: Long.MIN_VALUE)
++            starts.add(start)
++            ends.add(maxOf(reveal.ends[w], start))
++            texts.add(text)
++        }
++    }
++    return SungWords(starts.toLongArray(), ends.toLongArray(), texts.toTypedArray())
++}
++
++/** The last word that has started by [pos], or -1. */
++private fun wordAt(starts: LongArray, pos: Long): Int {
++    var low = 0
++    var high = starts.size - 1
++    var found = -1
++    while (low <= high) {
++        val mid = (low + high) ushr 1
++        if (starts[mid] <= pos) {
++            found = mid
++            low = mid + 1
++        } else {
++            high = mid - 1
++        }
++    }
++    return found
++}
++
++private fun mixF(from: Float, to: Float, fraction: Float): Float = from + (to - from) * fraction
++
++/** Rises to 1 and goes a little past it before settling. */
++private fun outBack(x: Float): Float {
++    val c = x.coerceIn(0f, 1f) - 1f
++    return 1f + 2.2f * c * c * c + 1.2f * c * c
++}
++
++/**
++ * The lyrics one word at a time, as a column of three.
++ *
++ * The word being sung is large and bold in the middle, with a small picture
++ * beside it where the word has one (a heart for "heart", a car for "car").
++ * The word just sung stays above it, small; the word coming up waits below,
++ * smaller still and tinted. When the next word is sung the whole column
++ * climbs a place with a little spring and a smear of motion: the word just
++ * sung goes up and small, the next grows into the middle, and a new one
++ * comes up below.
++ *
++ * Lyrics that are not synced have no "now" for the column to follow, so they
++ * are shown plainly, as in the classic view.
++ */
++@Composable
++fun KineticLyricsView(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    modifier: Modifier = Modifier,
++    showTranslation: Boolean = false,
++    onSeek: (Long) -> Unit,
++) {
++    if (!lyrics.synced) {
++        ClassicLyricsView(
++            lyrics = lyrics,
++            positionMs = positionMs,
++            modifier = modifier,
++            showTranslation = showTranslation,
++            onSeek = onSeek,
++        )
++    } else {
++        KineticColumn(lyrics, positionMs, modifier)
++    }
++}
++
++@Composable
++private fun KineticColumn(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    modifier: Modifier,
++) {
++    val ink = GlassInk
++    val measurer = rememberTextMeasurer()
++    val clock = rememberKineticClock(positionMs)
++    val words = remember(lyrics) { sungWordsOf(lyrics) }
++    val bigStyle = MaterialTheme.typography.headlineLarge.copy(
++        fontSize = BIG_SP.sp,
++        fontWeight = FontWeight.ExtraBold,
++        letterSpacing = (-1).sp,
++    )
++    val iconStyle = TextStyle(fontSize = (BIG_SP * 0.72f).sp)
++    // Each word measured once, the first time it is wanted, and kept while
++    // it is near; the maps are emptied now and then so a long song does not
++    // keep every word it has ever sung.
++    val layouts = remember(lyrics) { HashMap<Int, TextLayoutResult>() }
++    val iconLayouts = remember(lyrics) { HashMap<String, TextLayoutResult>() }
++
++    Canvas(modifier.fillMaxSize()) {
++        val count = words.texts.size
++        if (count == 0) return@Canvas
++        val pos = clock.value
++        val now = wordAt(words.starts, pos)
++        if (now < 0) return@Canvas
++        if (layouts.size > 48) layouts.clear()
++
++        // A long gap with nothing sung lets the words go.
++        val idle = (pos - words.ends[now] - IDLE_AFTER_MS).toFloat()
++        val overall = (1f - idle / IDLE_FADE_MS).coerceIn(0f, 1f)
++        if (overall <= 0f) return@Canvas
++
++        // The round buttons down the right of the screen keep to their own strip.
++        val left = 24.dp.toPx()
++        val right = size.width - 64.dp.toPx()
++        val centreX = (left + right) / 2f
++        val centreY = size.height * 0.46f
++        val roomWidth = right - left
++
++        // How far the column still has to climb to the word being sung.
++        val before = if (now > 0) words.starts[now - 1] else words.starts[now] - CLIMB_MAX_MS
++        val climbMs = (words.starts[now] - before).coerceIn(CLIMB_MIN_MS, CLIMB_MAX_MS).toFloat()
++        val progress = ((pos - words.starts[now]) / climbMs).coerceIn(0f, 1f)
++        val shift = 1f - outBack(progress)
++        // The smear peaks halfway through the climb.
++        val smear = sin(PI.toFloat() * progress)
++
++        val bigHeight = BIG_SP.sp.toPx()
++        val gap = 6.dp.toPx()
++        val nearStep = bigHeight * (0.5f + 0.5f * NEAR_SCALE) + gap
++        val farStep = bigHeight * (0.5f * NEAR_SCALE + 0.5f * FAR_SCALE) + gap
++
++        fun scaleAt(place: Float): Float {
++            val a = abs(place)
++            return when {
++                a < 1f -> mixF(1f, NEAR_SCALE, a)
++                a < 2f -> mixF(NEAR_SCALE, FAR_SCALE, a - 1f)
++                else -> FAR_SCALE
++            }
++        }
++
++        fun yAt(place: Float): Float {
++            val a = abs(place)
++            val step = if (a <= 1f) a * nearStep else nearStep + (a - 1f).coerceAtMost(1f) * farStep
++            return centreY + place.sign * step
++        }
++
++        fun alphaAt(place: Float): Float {
++            val a = abs(place)
++            val near = if (place > 0f) 0.6f else 0.65f
++            return if (a <= 1f) mixF(1f, near, a) else mixF(near, 0f, (a - 1f).coerceIn(0f, 1f))
++        }
++
++        // Farthest first, so the word being sung is drawn over the rest.
++        for (index in intArrayOf(now - 2, now + 2, now - 1, now + 1, now)) {
++            if (index < 0 || index >= count) continue
++            val place = (index - now) + shift
++            val alpha = alphaAt(place) * overall
++            if (alpha <= 0.01f) continue
++
++            val text = words.texts[index]
++            val layout = layouts.getOrPut(index) { measurer.measure(text, bigStyle) }
++            val icon = iconFor(text)
++            val iconLayout = icon?.let { iconLayouts.getOrPut(it) { measurer.measure(it, iconStyle) } }
++            val iconSpace = if (iconLayout != null) iconLayout.size.width + 12.dp.toPx() else 0f
++            val wholeWidth = layout.size.width + iconSpace
++
++            // A word wider than the room is made to fit it.
++            val fit = (roomWidth * 0.92f / wholeWidth).coerceAtMost(1f)
++            val scale = scaleAt(place) * fit
++            val y = yAt(place)
++            val color = if (place > 0f) lerp(ink, KineticAccent, place.coerceIn(0f, 1f)) else ink
++
++            // A word that is moving is smeared up and down, a little.
++            val reach = smear * bigHeight * 0.16f
++            val ghosts = reach > 2f
++            val offsets = if (ghosts) floatArrayOf(-reach, 0f, reach) else floatArrayOf(0f)
++            val weight = if (ghosts) floatArrayOf(0.3f, 0.5f, 0.3f) else floatArrayOf(1f)
++
++            for (k in offsets.indices) {
++                val centre = Offset(centreX, y + offsets[k])
++                withTransform({ scale(scale, scale, centre) }) {
++                    val startX = centre.x - wholeWidth / 2f
++                    if (iconLayout != null) {
++                        drawText(
++                            iconLayout,
++                            topLeft = Offset(startX, centre.y - iconLayout.size.height / 2f),
++                            alpha = alpha * weight[k],
++                        )
++                    }
++                    drawText(
++                        layout,
++                        color = color.copy(alpha = color.alpha * alpha * weight[k]),
++                        topLeft = Offset(startX + iconSpace, centre.y - layout.size.height / 2f),
++                    )
++                }
++            }
++        }
++    }
++}
+diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt T2/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt
+--- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt	2026-11-24 06:51:09.239948952 +0530
++++ T2/app/src/main/java/dev/lelonio/square/ui/player/LyricsOptions.kt	2026-11-24 12:50:59.455287595 +0530
+@@ -232,32 +232,38 @@
+                     }
+                 }
+                 Heading(stringResource(R.string.lyrics_style_title), top = 10.dp)
+-                // Two side by side, on one line: a choice of two does not need
+-                // two rows, and the panel has to fit the lyrics' own space.
+-                Row(
++                // Two to a line: the panel has to fit the lyrics' own space.
++                Column(
+                     Modifier.padding(horizontal = 18.dp),
+-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                 ) {
+-                    LyricsStyle.entries.forEach { option ->
+-                        val chosen = option == style
+-                        Text(
+-                            stringResource(
+-                                when (option) {
+-                                    LyricsStyle.ANIMATED -> R.string.lyrics_style_animated
+-                                    LyricsStyle.CLASSIC -> R.string.lyrics_style_classic
+-                                },
+-                            ),
+-                            style = MaterialTheme.typography.bodyMedium,
+-                            fontWeight = if (chosen) FontWeight.SemiBold else null,
+-                            color = if (chosen) Color.Black else GlassInk,
+-                            modifier = Modifier
+-                                .weight(1f)
+-                                .clip(RoundedCornerShape(50))
+-                                .background(if (chosen) GlassInk else GlassInk.copy(alpha = 0.12f))
+-                                .pressable({ onStyle(option) }, shape = RoundedCornerShape(50))
+-                                .padding(vertical = 9.dp),
+-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+-                        )
++                    LyricsStyle.entries.chunked(2).forEach { rowOptions ->
++                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                            rowOptions.forEach { option ->
++                                val chosen = option == style
++                                Text(
++                                    stringResource(
++                                        when (option) {
++                                            LyricsStyle.ANIMATED -> R.string.lyrics_style_animated
++                                            LyricsStyle.CLASSIC -> R.string.lyrics_style_classic
++                                            LyricsStyle.KINETIC -> R.string.lyrics_style_kinetic
++                                            LyricsStyle.NOTIFICATIONS -> R.string.lyrics_style_notifications
++                                        },
++                                    ),
++                                    style = MaterialTheme.typography.bodyMedium,
++                                    fontWeight = if (chosen) FontWeight.SemiBold else null,
++                                    color = if (chosen) Color.Black else GlassInk,
++                                    maxLines = 1,
++                                    modifier = Modifier
++                                        .weight(1f)
++                                        .clip(RoundedCornerShape(50))
++                                        .background(if (chosen) GlassInk else GlassInk.copy(alpha = 0.12f))
++                                        .pressable({ onStyle(option) }, shape = RoundedCornerShape(50))
++                                        .padding(vertical = 9.dp),
++                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
++                                )
++                            }
++                        }
+                     }
+                 }
+             }
+diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/NotificationsLyricsView.kt T2/app/src/main/java/dev/lelonio/square/ui/player/NotificationsLyricsView.kt
+--- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/NotificationsLyricsView.kt	1970-01-01 05:30:00.000000000 +0530
++++ T2/app/src/main/java/dev/lelonio/square/ui/player/NotificationsLyricsView.kt	2026-11-24 12:50:50.682950772 +0530
+@@ -0,0 +1,424 @@
++package dev.lelonio.square.ui.player
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.Spring
++import androidx.compose.animation.core.spring
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.gestures.detectVerticalDragGestures
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.derivedStateOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.key
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.ImageBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.graphics.luminance
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import dev.lelonio.square.R
++import dev.lelonio.square.data.LyricLine
++import dev.lelonio.square.data.Lyrics
++import kotlin.math.abs
++
++/**
++ * How far ahead of the song's reported position a notification arrives, for
++ * the same reason a message does (see MessagesLyricsView).
++ */
++private const val ARRIVE_LEAD_MS = 150L
++
++/** How many cards show behind the newest while the stack is closed. */
++private const val BEHIND = 2
++
++/**
++ * The lyrics as notifications, the way a phone stacks them.
++ *
++ * Each part of the song arrives as a glass notification from this app: its
++ * icon, its name and "now" along the top and the lyric as the subject. The
++ * next one drops in over it with a little spring, and the one before slips
++ * back, leaving only its edge showing under the new one, like the pile of
++ * them on a lock screen.
++ *
++ * Touching the pile, or pulling on it, opens it out into a list of everything
++ * sung so far, newest first, which can be scrolled; a card pressed there
++ * seeks to its line, and "Show less" closes it again. While it is open, new
++ * lines still arrive at the top.
++ *
++ * Lyrics that are not synced have no "now" for a pile to follow, so they are
++ * shown plainly, as in the classic view.
++ */
++@Composable
++fun NotificationsLyricsView(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    modifier: Modifier = Modifier,
++    showTranslation: Boolean = false,
++    onSeek: (Long) -> Unit,
++) {
++    if (!lyrics.synced) {
++        ClassicLyricsView(
++            lyrics = lyrics,
++            positionMs = positionMs,
++            modifier = modifier,
++            showTranslation = showTranslation,
++            onSeek = onSeek,
++        )
++    } else {
++        NotificationPile(lyrics, positionMs, modifier, showTranslation, onSeek)
++    }
++}
++
++@Composable
++private fun NotificationPile(
++    lyrics: Lyrics,
++    positionMs: State<Long>,
++    modifier: Modifier,
++    showTranslation: Boolean,
++    onSeek: (Long) -> Unit,
++) {
++    // Read as a derived value, so only a change of line recomposes this.
++    val activeLine by remember(lyrics) {
++        derivedStateOf {
++            lyrics.lines.indexOfLast { (it.startTimeMs ?: 0L) <= positionMs.value + ARRIVE_LEAD_MS }
++        }
++    }
++
++    // The lines sung so far that have words, newest first.
++    val shown = remember(lyrics, activeLine) {
++        (0..activeLine).filter { lyrics.lines[it].text.isNotBlank() }.asReversed()
++    }
++
++    val icon = rememberAppIcon()
++    val appName = stringResource(R.string.app_name)
++    var open by remember(lyrics) { mutableStateOf(false) }
++
++    if (shown.isEmpty()) return
++
++    if (open) {
++        OpenedPile(
++            lyrics = lyrics,
++            shown = shown,
++            icon = icon,
++            appName = appName,
++            showTranslation = showTranslation,
++            onSeek = onSeek,
++            onClose = { open = false },
++            modifier = modifier,
++        )
++    } else {
++        ClosedPile(
++            lyrics = lyrics,
++            shown = shown,
++            icon = icon,
++            appName = appName,
++            showTranslation = showTranslation,
++            onOpen = { open = true },
++            modifier = modifier,
++        )
++    }
++}
++
++/** The newest notification, with the edges of the ones before it showing behind. */
++@Composable
++private fun ClosedPile(
++    lyrics: Lyrics,
++    shown: List<Int>,
++    icon: ImageBitmap?,
++    appName: String,
++    showTranslation: Boolean,
++    onOpen: () -> Unit,
++    modifier: Modifier,
++) {
++    val ink = GlassInk
++    val newest = shown.first()
++    val behind = minOf(BEHIND, shown.size - 1)
++
++    Box(
++        modifier
++            .fillMaxSize()
++            .padding(start = 16.dp, end = 64.dp, top = 56.dp),
++        contentAlignment = Alignment.TopCenter,
++    ) {
++        Box(
++            Modifier
++                .fillMaxWidth()
++                .clickable(onClick = onOpen)
++                .pointerInput(Unit) {
++                    detectVerticalDragGestures { _, drag -> if (abs(drag) > 4f) onOpen() }
++                },
++        ) {
++            // The edges of the ones before, farthest first. They take the
++            // newest card's size, so each shows as a strip under it.
++            for (rank in behind downTo 1) {
++                val scale = 1f - 0.06f * rank
++                Box(
++                    Modifier
++                        .matchParentSize()
++                        .graphicsLayer {
++                            scaleX = scale
++                            scaleY = scale
++                            translationY = rank * 10.dp.toPx() + size.height * (1f - scale) / 2f
++                            alpha = 1f - 0.3f * rank
++                        }
++                        .glass(ink),
++                )
++            }
++
++            // The one that was newest a moment ago slips back under the new one.
++            if (shown.size > 1) {
++                key(shown[1]) {
++                    val slip = remember { Animatable(0f) }
++                    LaunchedEffect(Unit) { slip.animateTo(1f, tween(260)) }
++                    val line = lyrics.lines[shown[1]]
++                    NotificationCard(
++                        icon = icon,
++                        appName = appName,
++                        time = "now",
++                        text = line.text,
++                        translation = line.translation.takeIf { showTranslation && !it.isNullOrBlank() },
++                        modifier = Modifier
++                            .matchParentSize()
++                            .clip(RoundedCornerShape(26.dp))
++                            .graphicsLayer {
++                                val p = slip.value
++                                scaleX = 1f - 0.06f * p
++                                scaleY = 1f - 0.06f * p
++                                translationY = 10.dp.toPx() * p + size.height * 0.06f * p / 2f
++                                alpha = 1f - p
++                            },
++                    )
++                }
++            }
++
++            // The new one drops in over them.
++            key(newest) {
++                val arrive = remember { Animatable(0f) }
++                LaunchedEffect(Unit) {
++                    arrive.animateTo(1f, spring(dampingRatio = 0.62f, stiffness = Spring.StiffnessMedium))
++                }
++                val line = lyrics.lines[newest]
++                NotificationCard(
++                    icon = icon,
++                    appName = appName,
++                    time = "now",
++                    text = line.text,
++                    translation = line.translation.takeIf { showTranslation && !it.isNullOrBlank() },
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .graphicsLayer {
++                            val p = arrive.value
++                            translationY = -(1f - p) * 40.dp.toPx()
++                            alpha = p.coerceIn(0f, 1f)
++                            scaleX = 0.94f + 0.06f * p
++                            scaleY = 0.94f + 0.06f * p
++                        },
++                )
++            }
++        }
++    }
++}
++
++/** Everything sung so far as a list of notifications, newest first. */
++@Composable
++private fun OpenedPile(
++    lyrics: Lyrics,
++    shown: List<Int>,
++    icon: ImageBitmap?,
++    appName: String,
++    showTranslation: Boolean,
++    onSeek: (Long) -> Unit,
++    onClose: () -> Unit,
++    modifier: Modifier,
++) {
++    val ink = GlassInk
++    val listState = remember(lyrics) { LazyListState() }
++    val newest = shown.first()
++
++    // A new one arriving brings the list back to the top, unless the listener
++    // is reading further down.
++    LaunchedEffect(newest) {
++        if (!listState.isScrollInProgress && listState.firstVisibleItemIndex <= 1) {
++            listState.animateScrollToItem(0)
++        }
++    }
++
++    LazyColumn(
++        state = listState,
++        // The round buttons down the right of the screen keep to their own strip.
++        contentPadding = PaddingValues(start = 16.dp, end = 64.dp, top = 56.dp, bottom = 48.dp),
++        verticalArrangement = Arrangement.spacedBy(8.dp),
++        modifier = modifier.fillMaxSize(),
++    ) {
++        item(key = "close") {
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++                Text(
++                    stringResource(R.string.lyrics_notifications_show_less),
++                    style = MaterialTheme.typography.labelLarge,
++                    fontWeight = FontWeight.SemiBold,
++                    color = ink,
++                    modifier = Modifier
++                        .clip(RoundedCornerShape(50))
++                        .glass(ink, RoundedCornerShape(50))
++                        .clickable(onClick = onClose)
++                        .padding(horizontal = 14.dp, vertical = 7.dp),
++                )
++            }
++        }
++        items(shown, key = { it }) { index ->
++            val line: LyricLine = lyrics.lines[index]
++            NotificationCard(
++                icon = icon,
++                appName = appName,
++                time = if (index == newest) "now" else clock(line.startTimeMs ?: 0L),
++                text = line.text,
++                translation = line.translation.takeIf { showTranslation && !it.isNullOrBlank() },
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .animateItem()
++                    .clickable { line.startTimeMs?.let(onSeek) },
++            )
++        }
++    }
++}
++
++/** One glass notification: the app's icon and name, when, and the lyric as its subject. */
++@Composable
++private fun NotificationCard(
++    icon: ImageBitmap?,
++    appName: String,
++    time: String,
++    text: String,
++    translation: String?,
++    modifier: Modifier = Modifier,
++) {
++    val ink = GlassInk
++    Row(
++        modifier
++            .clip(RoundedCornerShape(26.dp))
++            .glass(ink)
++            .padding(horizontal = 14.dp, vertical = 12.dp),
++        horizontalArrangement = Arrangement.spacedBy(12.dp),
++    ) {
++        AppIcon(icon, ink)
++        Column(Modifier.weight(1f)) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    appName,
++                    style = MaterialTheme.typography.labelMedium,
++                    fontWeight = FontWeight.SemiBold,
++                    color = ink.copy(alpha = 0.7f),
++                    maxLines = 1,
++                    modifier = Modifier.weight(1f),
++                )
++                Text(
++                    time,
++                    style = MaterialTheme.typography.labelSmall,
++                    color = ink.copy(alpha = 0.55f),
++                    maxLines = 1,
++                )
++            }
++            Text(
++                text,
++                style = MaterialTheme.typography.titleMedium.copy(fontSize = 17.sp),
++                fontWeight = FontWeight.SemiBold,
++                color = ink,
++                modifier = Modifier.padding(top = 2.dp),
++            )
++            if (translation != null) {
++                Text(
++                    translation,
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = ink.copy(alpha = 0.7f),
++                    modifier = Modifier.padding(top = 2.dp),
++                )
++            }
++        }
++    }
++}
++
++@Composable
++private fun AppIcon(icon: ImageBitmap?, ink: Color) {
++    val shape = RoundedCornerShape(10.dp)
++    if (icon != null) {
++        Image(
++            bitmap = icon,
++            contentDescription = null,
++            modifier = Modifier.size(38.dp).clip(shape),
++        )
++    } else {
++        Box(Modifier.size(38.dp).clip(shape).background(ink.copy(alpha = 0.2f)))
++    }
++}
++
++/**
++ * The look of a pane of glass over the player's backdrop: a film dark enough
++ * (or, in the light setting, light enough) for the words on it to be read
++ * whatever is behind, a faint tint of the app's ink and a thin edge.
++ */
++@Composable
++private fun Modifier.glass(
++    ink: Color,
++    shape: RoundedCornerShape = RoundedCornerShape(26.dp),
++): Modifier {
++    val darkBackdrop = ink.luminance() > 0.5f
++    val film = if (darkBackdrop) Color.Black.copy(alpha = 0.42f) else Color.White.copy(alpha = 0.6f)
++    return this
++        .background(film, shape)
++        .background(ink.copy(alpha = 0.08f), shape)
++        .border(1.dp, ink.copy(alpha = 0.2f), shape)
++}
++
++/** This app's own icon, drawn once at a size that is sharp at a notification's. */
++@Composable
++private fun rememberAppIcon(): ImageBitmap? {
++    val context = LocalContext.current
++    return remember(context) {
++        runCatching {
++            val drawable = context.packageManager.getApplicationIcon(context.packageName)
++            val side = 128
++            val bitmap = android.graphics.Bitmap.createBitmap(
++                side, side, android.graphics.Bitmap.Config.ARGB_8888,
++            )
++            drawable.setBounds(0, 0, side, side)
++            drawable.draw(android.graphics.Canvas(bitmap))
++            bitmap.asImageBitmap()
++        }.getOrNull()
++    }
++}
++
++/** A time in the song as m:ss. */
++private fun clock(ms: Long): String {
++    val seconds = (ms / 1000L).coerceAtLeast(0L)
++    return "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
++}
+diff -ruN orig/Square-master/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt T2/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt
+--- Square-orig/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt	2026-11-24 06:51:09.240043132 +0530
++++ T2/app/src/main/java/dev/lelonio/square/ui/player/PlayerScreen.kt	2026-11-24 12:50:50.715284192 +0530
+@@ -3017,6 +3017,30 @@
+                 color = GlassInkDim,
+             )
+ 
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.KINETIC -> CompositionLocalProvider(
++                LocalLayoutDirection provides songDirection,
++            ) {
++                KineticLyricsView(
++                    lyrics = shown ?: lyrics,
++                    positionMs = heardMs,
++                    showTranslation = translated || romanized,
++                    onSeek = seekHeard,
++                    modifier = Modifier.fillMaxSize(),
++                )
++            }
++
++            style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.NOTIFICATIONS -> CompositionLocalProvider(
++                LocalLayoutDirection provides songDirection,
++            ) {
++                NotificationsLyricsView(
++                    lyrics = shown ?: lyrics,
++                    positionMs = heardMs,
++                    showTranslation = translated || romanized,
++                    onSeek = seekHeard,
++                    modifier = Modifier.fillMaxSize(),
++                )
++            }
++
+             style == dev.lelonio.square.data.PreferencesStore.LyricsStyle.CLASSIC -> CompositionLocalProvider(
+                 LocalLayoutDirection provides songDirection,
+             ) {
+diff -ruN orig/Square-master/app/src/main/res/values/strings.xml T2/app/src/main/res/values/strings.xml
+--- Square-orig/app/src/main/res/values/strings.xml	2026-11-24 06:51:09.242185387 +0530
++++ T2/app/src/main/res/values/strings.xml	2026-11-24 12:50:59.456018816 +0530
+@@ -657,6 +657,9 @@
+     <string name="lyrics_style_title">Style</string>
+     <string name="lyrics_style_animated">Animated</string>
+     <string name="lyrics_style_classic">Classic</string>
++    <string name="lyrics_style_kinetic">Kinetic</string>
++    <string name="lyrics_style_notifications">Alerts</string>
++    <string name="lyrics_notifications_show_less">Show less</string>
+     <string name="lyrics_word">Word by word</string>
+     <string name="lyrics_line">By line</string>
+     <string name="lyrics_unsynced">Not synced</string>
+diff -ruN orig/Square-master/app/src/main/res/values-de/strings.xml T2/app/src/main/res/values-de/strings.xml
+--- Square-orig/app/src/main/res/values-de/strings.xml	2026-11-24 06:51:09.241691229 +0530
++++ T2/app/src/main/res/values-de/strings.xml	2026-11-24 12:50:59.456555574 +0530
+@@ -591,6 +591,9 @@
+     <string name="lyrics_style_title">Stil</string>
+     <string name="lyrics_style_animated">Animiert</string>
+     <string name="lyrics_style_classic">Klassisch</string>
++    <string name="lyrics_style_kinetic">Kinetisch</string>
++    <string name="lyrics_style_notifications">Mitteilungen</string>
++    <string name="lyrics_notifications_show_less">Weniger</string>
+     <string name="lyrics_word">Wort für Wort</string>
+     <string name="lyrics_line">Zeilenweise</string>
+     <string name="lyrics_unsynced">Nicht synchron</string>
+diff -ruN orig/Square-master/app/src/main/res/values-es/strings.xml T2/app/src/main/res/values-es/strings.xml
+--- Square-orig/app/src/main/res/values-es/strings.xml	2026-11-24 06:51:09.241729074 +0530
++++ T2/app/src/main/res/values-es/strings.xml	2026-11-24 12:50:59.456977028 +0530
+@@ -597,6 +597,9 @@
+     <string name="lyrics_style_title">Estilo</string>
+     <string name="lyrics_style_animated">Animado</string>
+     <string name="lyrics_style_classic">Clásico</string>
++    <string name="lyrics_style_kinetic">Cinético</string>
++    <string name="lyrics_style_notifications">Avisos</string>
++    <string name="lyrics_notifications_show_less">Ver menos</string>
+     <string name="lyrics_word">Palabra por palabra</string>
+     <string name="lyrics_line">Por línea</string>
+     <string name="lyrics_unsynced">Sin sincronizar</string>
+diff -ruN orig/Square-master/app/src/main/res/values-fr/strings.xml T2/app/src/main/res/values-fr/strings.xml
+--- Square-orig/app/src/main/res/values-fr/strings.xml	2026-11-24 06:51:09.241779043 +0530
++++ T2/app/src/main/res/values-fr/strings.xml	2026-11-24 12:50:59.457450350 +0530
+@@ -591,6 +591,9 @@
+     <string name="lyrics_style_title">Style</string>
+     <string name="lyrics_style_animated">Animé</string>
+     <string name="lyrics_style_classic">Classique</string>
++    <string name="lyrics_style_kinetic">Cinétique</string>
++    <string name="lyrics_style_notifications">Alertes</string>
++    <string name="lyrics_notifications_show_less">Réduire</string>
+     <string name="lyrics_word">Mot à mot</string>
+     <string name="lyrics_line">Par ligne</string>
+     <string name="lyrics_unsynced">Non synchronisées</string>
+diff -ruN orig/Square-master/app/src/main/res/values-hi/strings.xml T2/app/src/main/res/values-hi/strings.xml
+--- Square-orig/app/src/main/res/values-hi/strings.xml	2026-11-24 06:51:09.241826069 +0530
++++ T2/app/src/main/res/values-hi/strings.xml	2026-11-24 12:50:59.457975522 +0530
+@@ -606,6 +606,9 @@
+     <string name="lyrics_style_title">शैली</string>
+     <string name="lyrics_style_animated">एनिमेटेड</string>
+     <string name="lyrics_style_classic">क्लासिक</string>
++    <string name="lyrics_style_kinetic">काइनेटिक</string>
++    <string name="lyrics_style_notifications">सूचनाएँ</string>
++    <string name="lyrics_notifications_show_less">कम दिखाएँ</string>
+     <string name="lyrics_word">शब्द-दर-शब्द</string>
+     <string name="lyrics_line">पंक्ति-दर-पंक्ति</string>
+     <string name="lyrics_unsynced">सिंक नहीं</string>
+diff -ruN orig/Square-master/app/src/main/res/values-it/strings.xml T2/app/src/main/res/values-it/strings.xml
+--- Square-orig/app/src/main/res/values-it/strings.xml	2026-11-24 06:51:09.241874537 +0530
++++ T2/app/src/main/res/values-it/strings.xml	2026-11-24 12:50:59.458503405 +0530
+@@ -630,6 +630,9 @@
+     <string name="lyrics_style_title">Stile</string>
+     <string name="lyrics_style_animated">Animato</string>
+     <string name="lyrics_style_classic">Classico</string>
++    <string name="lyrics_style_kinetic">Cinetico</string>
++    <string name="lyrics_style_notifications">Avvisi</string>
++    <string name="lyrics_notifications_show_less">Mostra meno</string>
+     <string name="lyrics_word">Parola per parola</string>
+     <string name="lyrics_line">Per riga</string>
+     <string name="lyrics_unsynced">Non sincronizzato</string>
+diff -ruN orig/Square-master/app/src/main/res/values-ja/strings.xml T2/app/src/main/res/values-ja/strings.xml
+--- Square-orig/app/src/main/res/values-ja/strings.xml	2026-11-24 06:51:09.241917074 +0530
++++ T2/app/src/main/res/values-ja/strings.xml	2026-11-24 12:50:59.458944083 +0530
+@@ -647,6 +647,9 @@
+     <string name="lyrics_style_title">表示スタイル</string>
+     <string name="lyrics_style_animated">アニメーション</string>
+     <string name="lyrics_style_classic">クラシック</string>
++    <string name="lyrics_style_kinetic">キネティック</string>
++    <string name="lyrics_style_notifications">通知</string>
++    <string name="lyrics_notifications_show_less">閉じる</string>
+     <string name="lyrics_word">単語単位で同期</string>
+     <string name="lyrics_line">行単位で同期</string>
+     <string name="lyrics_unsynced">未同期</string>
+diff -ruN orig/Square-master/app/src/main/res/values-ko/strings.xml T2/app/src/main/res/values-ko/strings.xml
+--- Square-orig/app/src/main/res/values-ko/strings.xml	2026-11-24 06:51:09.241961172 +0530
++++ T2/app/src/main/res/values-ko/strings.xml	2026-11-24 12:50:59.459424204 +0530
+@@ -615,6 +615,9 @@
+     <string name="lyrics_style_title">스타일</string>
+     <string name="lyrics_style_animated">애니메이션</string>
+     <string name="lyrics_style_classic">클래식</string>
++    <string name="lyrics_style_kinetic">키네틱</string>
++    <string name="lyrics_style_notifications">알림</string>
++    <string name="lyrics_notifications_show_less">접기</string>
+     <string name="lyrics_word">단어별</string>
+     <string name="lyrics_line">줄별</string>
+     <string name="lyrics_unsynced">동기화되지 않음</string>
+diff -ruN orig/Square-master/app/src/main/res/values-pt/strings.xml T2/app/src/main/res/values-pt/strings.xml
+--- Square-orig/app/src/main/res/values-pt/strings.xml	2026-11-24 06:51:09.242001596 +0530
++++ T2/app/src/main/res/values-pt/strings.xml	2026-11-24 12:50:59.459799378 +0530
+@@ -591,6 +591,9 @@
+     <string name="lyrics_style_title">Estilo</string>
+     <string name="lyrics_style_animated">Animado</string>
+     <string name="lyrics_style_classic">Clássico</string>
++    <string name="lyrics_style_kinetic">Cinético</string>
++    <string name="lyrics_style_notifications">Avisos</string>
++    <string name="lyrics_notifications_show_less">Mostrar menos</string>
+     <string name="lyrics_word">Palavra por palavra</string>
+     <string name="lyrics_line">Por linha</string>
+     <string name="lyrics_unsynced">Não sincronizada</string>
+diff -ruN orig/Square-master/app/src/main/res/values-ru/strings.xml T2/app/src/main/res/values-ru/strings.xml
+--- Square-orig/app/src/main/res/values-ru/strings.xml	2026-11-24 06:51:09.242042412 +0530
++++ T2/app/src/main/res/values-ru/strings.xml	2026-11-24 12:50:59.460290210 +0530
+@@ -620,6 +620,9 @@
+     <string name="lyrics_style_title">Стиль</string>
+     <string name="lyrics_style_animated">Анимированный</string>
+     <string name="lyrics_style_classic">Классический</string>
++    <string name="lyrics_style_kinetic">Кинетика</string>
++    <string name="lyrics_style_notifications">Уведомления</string>
++    <string name="lyrics_notifications_show_less">Свернуть</string>
+     <string name="lyrics_word">По словам</string>
+     <string name="lyrics_line">По строкам</string>
+     <string name="lyrics_unsynced">Без синхронизации</string>
+diff -ruN orig/Square-master/app/src/main/res/values-tr/strings.xml T2/app/src/main/res/values-tr/strings.xml
+--- Square-orig/app/src/main/res/values-tr/strings.xml	2026-11-24 06:51:09.242083802 +0530
++++ T2/app/src/main/res/values-tr/strings.xml	2026-11-24 12:50:59.460708078 +0530
+@@ -604,6 +604,9 @@
+     <string name="lyrics_style_title">Stil</string>
+     <string name="lyrics_style_animated">Animasyonlu</string>
+     <string name="lyrics_style_classic">Klasik</string>
++    <string name="lyrics_style_kinetic">Kinetik</string>
++    <string name="lyrics_style_notifications">Bildirimler</string>
++    <string name="lyrics_notifications_show_less">Daha az</string>
+     <string name="lyrics_word">Kelime kelime</string>
+     <string name="lyrics_line">Satır satır</string>
+     <string name="lyrics_unsynced">Senkronize değil</string>
+diff -ruN orig/Square-master/app/src/main/res/values-vi/strings.xml T2/app/src/main/res/values-vi/strings.xml
+--- Square-orig/app/src/main/res/values-vi/strings.xml	2026-11-24 06:51:09.242125718 +0530
++++ T2/app/src/main/res/values-vi/strings.xml	2026-11-24 12:50:59.461292811 +0530
+@@ -650,6 +650,9 @@
+     <string name="lyrics_style_title">Kiểu</string>
+     <string name="lyrics_style_animated">Động</string>
+     <string name="lyrics_style_classic">Cổ điển</string>
++    <string name="lyrics_style_kinetic">Động</string>
++    <string name="lyrics_style_notifications">Thông báo</string>
++    <string name="lyrics_notifications_show_less">Thu gọn</string>
+     <string name="lyrics_word">Theo từng từ</string>
+     <string name="lyrics_line">Theo từng dòng</string>
+     <string name="lyrics_unsynced">Chưa đồng bộ</string>
